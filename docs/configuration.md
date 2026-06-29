@@ -50,3 +50,5 @@ For deterministic tests:
 seal.setClockTimestamp(1710000000);
 seal.clearClockTimestamp();
 ```
+
+When `SealConfig::addIssuedAtByDefault` is true, `sign()` adds `iat` only if a fixed clock or time provider returns an epoch timestamp. If no clock is available, signing still succeeds and `iat` is silently omitted.

@@ -33,7 +33,7 @@ SealResult verify(const char* token, const char* secret, JsonDocument& outPayloa
 SealResult verify(const char* token, const char* secret, const SealVerifyOptions& options, JsonDocument& outPayload);
 ```
 
-Verification requires exactly three token segments, `alg` equal to `HS256`, a non-empty signature, valid JSON, a matching HMAC-SHA256 signature, and matching configured claims.
+Verification requires exactly three token segments, `alg` equal to `HS256`, a non-empty signature, valid JSON, a matching HMAC-SHA256 signature, and matching configured claims. The `typ` header is ignored by default for interoperability.
 
 ## Decode
 
@@ -54,6 +54,12 @@ SealResult decode(const char* token, SealDecodeCallback callback);
 ```
 
 Async callbacks run from Seal's worker task. The `JsonDocument&` passed to verify and decode callbacks is valid only during the callback.
+
+Async submissions are accepted only while Seal is running. `deinit()` rejects work, signals the worker without depending on queue capacity, waits for worker completion, and securely discards queued jobs without invoking callbacks. Do not call `deinit()` from an async callback; it returns `SealCode::Busy`.
+
+## Base64url
+
+Seal emits unpadded JWT base64url. Decode and verify accept trailing `=` padding on token segments.
 
 ## Crypto Backend
 

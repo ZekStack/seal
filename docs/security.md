@@ -22,6 +22,12 @@ Secrets stored in firmware can be extracted when physical compromise is in scope
 
 `exp`, `nbf`, and `maxAgeSeconds` validation require a valid epoch clock. If time is required and unavailable, Seal returns `SealCode::ClockUnavailable`.
 
+`exp` is expired at the exact expiration timestamp when clock tolerance is zero. `nbf` and `maxAgeSeconds` use the configured `clockToleranceSeconds` without additive timestamp overflow.
+
+## Header Behavior
+
+Seal requires `alg` to be exactly `HS256`. The `typ` header is ignored by default, so tokens from issuers that use different `typ` casing or values can still verify when the algorithm, signature, JSON payload, and claims are valid.
+
 ## Crypto Backend Boundary
 
 Production v0.1 crypto uses mbedTLS behind `SealCrypto.h`. This boundary exists so the backend can be replaced later without changing the public Seal API.

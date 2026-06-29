@@ -1,6 +1,6 @@
 {
   "name": "Seal",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "JWT signing, verification, and decode library for ESP32.",
   "keywords": [
     "esp32",

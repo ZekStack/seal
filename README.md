@@ -2,7 +2,7 @@
 
 Seal is a compact JWT/JWS signing, verification, and decode library for ESP32.
 
-Seal helps Arduino ESP32 projects create and validate HS256 JSON Web Tokens with bounded memory, result-based errors, async APIs, and an internal crypto backend boundary.
+Seal helps Arduino ESP32 projects create and validate HS256 JSON Web Tokens with caller-configurable size limits, bounded dynamic allocations, result-based errors, async APIs, and an internal crypto backend boundary.
 
 [![CI](https://github.com/ZekStack/seal/actions/workflows/ci.yml/badge.svg)](https://github.com/ZekStack/seal/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ZekStack/seal?sort=semver)](https://github.com/ZekStack/seal/releases)
@@ -89,6 +89,10 @@ void loop() {
 JWT payloads are signed, not encrypted. Anyone who has the token can read its header and payload.
 
 HS256 uses the same shared secret for signing and verification. Weak secrets make tokens forgeable.
+
+When `addIssuedAtByDefault` is enabled and no clock provider or fixed clock is available, Seal signs without adding `iat`.
+
+Verification requires `alg: "HS256"` and ignores `typ` by default for interoperability. Seal accepts unpadded JWT base64url and leniently accepts trailing `=` padding.
 
 ## Examples
 

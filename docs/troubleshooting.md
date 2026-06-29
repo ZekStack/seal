@@ -19,3 +19,7 @@ The payload, header, token, or caller-provided output buffer is smaller than req
 ## Async Callback Did Not Run
 
 Confirm `SealConfig::enableAsync` is true and the async submit call returned success.
+
+## `Busy` During Shutdown
+
+Seal returns `Busy` while shutdown is in progress, while an async callback is running, or if `deinit()` is called from the worker task. Call `deinit()` again later if a previous shutdown attempt timed out.

@@ -1,6 +1,6 @@
 # Memory
 
-Seal enforces configured size limits before accepting or producing tokens.
+Seal enforces configured size limits before accepting or producing tokens. Internally, Seal uses bounded dynamic allocations for serialization, token building, decoded segments, and queued async jobs.
 
 ## Defaults
 
@@ -27,6 +27,8 @@ seal.sign(payload, options, secret, token, sizeof(token), written);
 ## Async Jobs
 
 Async calls copy the serialized payload, token string, secret, options, and callback before returning. If the configured limits are exceeded, submission fails immediately.
+
+During `deinit()`, queued async jobs that have not started may be securely discarded without invoking callbacks. Copied secrets and token buffers are cleared before those jobs are released.
 
 ## PSRAM
 

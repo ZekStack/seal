@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -16,6 +17,8 @@
 
 #if defined(ESP32)
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #endif
 
 namespace {
@@ -24,7 +27,12 @@ enum class SealJobType : uint8_t {
 	Sign,
 	Verify,
 	Decode,
-	Stop,
+};
+
+enum class SealLifecycle : uint8_t {
+	Stopped,
+	Running,
+	Stopping,
 };
 
 bool isEmpty(const char *value) {
@@ -149,12 +157,19 @@ SealResult splitToken(const char *token, size_t maxTokenSize, TokenSegments &seg
 	return SealResult::success();
 }
 
+bool jsonStringEquals(JsonString actual, const char *expected) {
+	if (expected == nullptr) {
+		return true;
+	}
+	return actual && actual.size() == std::strlen(expected) &&
+	       std::memcmp(actual.c_str(), expected, actual.size()) == 0;
+}
+
 bool stringClaimEquals(JsonDocument &payload, const char *claim, const char *expected) {
 	if (expected == nullptr) {
 		return true;
 	}
-	const char *actual = payload[claim] | nullptr;
-	return actual != nullptr && std::strcmp(actual, expected) == 0;
+	return jsonStringEquals(payload[claim].as<JsonString>(), expected);
 }
 
 bool getNumericClaim(JsonDocument &payload, const char *claim, uint64_t &out) {
@@ -165,10 +180,39 @@ bool getNumericClaim(JsonDocument &payload, const char *claim, uint64_t &out) {
 	return true;
 }
 
+SealResult resultForLifecycle(SealLifecycle lifecycle) {
+	if (lifecycle == SealLifecycle::Stopped) {
+		return SealResult::failure(SealCode::NotInitialized, "seal is not initialized");
+	}
+	return SealResult::failure(SealCode::Busy, "seal is stopping");
+}
+
+bool expiredAtOrAfter(uint64_t now, uint64_t boundary, uint32_t toleranceSeconds) {
+	if (now < boundary) {
+		return false;
+	}
+	return now - boundary >= static_cast<uint64_t>(toleranceSeconds);
+}
+
+bool notActiveBefore(uint64_t now, uint64_t notBefore, uint32_t toleranceSeconds) {
+	return now < notBefore && notBefore - now > static_cast<uint64_t>(toleranceSeconds);
+}
+
+bool maxAgeExceeded(uint64_t now, uint64_t issuedAt, uint64_t maxAgeSeconds, uint32_t toleranceSeconds) {
+	if (now < issuedAt) {
+		return false;
+	}
+	const uint64_t age = now - issuedAt;
+	if (age < maxAgeSeconds) {
+		return false;
+	}
+	return age - maxAgeSeconds >= static_cast<uint64_t>(toleranceSeconds);
+}
+
 } // namespace
 
 struct SealJob {
-	SealJobType type = SealJobType::Stop;
+	SealJobType type = SealJobType::Decode;
 	std::string payloadJson;
 	std::string token;
 	std::string secret;
@@ -185,11 +229,13 @@ struct SealImpl {
 	SealTimeProvider timeProvider;
 	uint64_t fixedClockTimestamp = 0;
 	bool useFixedClockTimestamp = false;
-	bool initialized = false;
-	bool inCallback = false;
+	SealLifecycle lifecycle = SealLifecycle::Stopped;
+	bool stopRequested = false;
+	uint16_t callbackDepth = 0;
 #if defined(ESP32)
 	QueueHandle_t queue = nullptr;
 	TaskHandle_t task = nullptr;
+	SemaphoreHandle_t doneSignal = nullptr;
 	bool taskCreatedWithCaps = false;
 #endif
 
@@ -234,11 +280,11 @@ struct SealImpl {
 	    const JsonDocument &payload,
 	    const SealOptions &options,
 	    const char *secret,
-	    std::string &outToken
+		std::string &outToken
 	) {
 		outToken.clear();
-		if (!initialized) {
-			return SealResult::failure(SealCode::NotInitialized, "seal is not initialized");
+		if (lifecycle != SealLifecycle::Running) {
+			return resultForLifecycle(lifecycle);
 		}
 		if (isEmpty(secret)) {
 			return SealResult::failure(SealCode::InvalidArgument, "secret is required");
@@ -260,11 +306,14 @@ struct SealImpl {
 		std::string headerJson;
 		SealResult result = serializeDocument(header, config.maxHeaderSize, headerJson);
 		if (!result) {
+			if (result.code == SealCode::BufferTooSmall) {
+				return result;
+			}
 			return SealResult::failure(SealCode::InvalidHeader, result.message);
 		}
 
 		JsonDocument workingPayload;
-		workingPayload.set(payload);
+		workingPayload.set(payload.as<JsonObjectConst>());
 		JsonObject object = workingPayload.as<JsonObject>();
 		if (options.iat > 0) {
 			object["iat"] = options.iat;
@@ -296,6 +345,9 @@ struct SealImpl {
 		std::string payloadJson;
 		result = serializeDocument(workingPayload, config.maxPayloadSize, payloadJson);
 		if (!result) {
+			if (result.code == SealCode::BufferTooSmall) {
+				return result;
+			}
 			return SealResult::failure(SealCode::InvalidPayload, result.message);
 		}
 
@@ -398,11 +450,11 @@ struct SealImpl {
 
 		if (outHeader != nullptr) {
 			outHeader->clear();
-			outHeader->set(header);
+			outHeader->set(header.as<JsonObjectConst>());
 		}
 		if (outPayload != nullptr) {
 			outPayload->clear();
-			outPayload->set(payload);
+			outPayload->set(payload.as<JsonObjectConst>());
 		}
 		if (outSegments != nullptr) {
 			*outSegments = segments;
@@ -416,8 +468,8 @@ struct SealImpl {
 	    const SealVerifyOptions &options,
 	    JsonDocument &outPayload
 	) {
-		if (!initialized) {
-			return SealResult::failure(SealCode::NotInitialized, "seal is not initialized");
+		if (lifecycle != SealLifecycle::Running) {
+			return resultForLifecycle(lifecycle);
 		}
 		if (isEmpty(secret)) {
 			return SealResult::failure(SealCode::InvalidArgument, "secret is required");
@@ -431,16 +483,12 @@ struct SealImpl {
 			return result;
 		}
 
-		const char *alg = header["alg"] | nullptr;
-		if (alg == nullptr) {
+		JsonString alg = header["alg"].as<JsonString>();
+		if (!alg) {
 			return SealResult::failure(SealCode::InvalidHeader, "jwt alg is required");
 		}
-		if (std::strcmp(alg, "HS256") != 0) {
+		if (!jsonStringEquals(alg, "HS256")) {
 			return SealResult::failure(SealCode::AlgorithmMismatch, "jwt alg is not HS256");
-		}
-		const char *typ = header["typ"] | nullptr;
-		if (typ != nullptr && std::strcmp(typ, "JWT") != 0) {
-			return SealResult::failure(SealCode::InvalidHeader, "jwt typ must be JWT");
 		}
 		if (segments.signatureLength == 0) {
 			return SealResult::failure(SealCode::SignatureRequired, "jwt signature is required");
@@ -513,7 +561,7 @@ struct SealImpl {
 			if (!result) {
 				return result;
 			}
-			if (now > exp + options.clockToleranceSeconds) {
+			if (expiredAtOrAfter(now, exp, options.clockToleranceSeconds)) {
 				return SealResult::failure(SealCode::Expired, "jwt expired");
 			}
 		}
@@ -527,7 +575,7 @@ struct SealImpl {
 			if (!result) {
 				return result;
 			}
-			if (now + options.clockToleranceSeconds < nbf) {
+			if (notActiveBefore(now, nbf, options.clockToleranceSeconds)) {
 				return SealResult::failure(SealCode::NotActive, "jwt not active");
 			}
 		}
@@ -541,7 +589,7 @@ struct SealImpl {
 			if (!result) {
 				return result;
 			}
-			if (now > iat + options.maxAgeSeconds + options.clockToleranceSeconds) {
+			if (maxAgeExceeded(now, iat, options.maxAgeSeconds, options.clockToleranceSeconds)) {
 				return SealResult::failure(SealCode::Expired, "jwt maxAge exceeded");
 			}
 		}
@@ -560,7 +608,7 @@ struct SealImpl {
 		}
 
 		outPayload.clear();
-		outPayload.set(payload);
+		outPayload.set(payload.as<JsonObjectConst>());
 		return SealResult::success();
 	}
 
@@ -568,8 +616,14 @@ struct SealImpl {
 		if (job == nullptr) {
 			return SealResult::failure(SealCode::AllocationFailed, "job allocation failed");
 		}
+		if (lifecycle != SealLifecycle::Running) {
+			secureJob(job);
+			delete job;
+			return resultForLifecycle(lifecycle);
+		}
 #if defined(ESP32)
 		if (!config.enableAsync || queue == nullptr) {
+			secureJob(job);
 			delete job;
 			return SealResult::failure(SealCode::InvalidArgument, "async is disabled");
 		}
@@ -580,6 +634,7 @@ struct SealImpl {
 		}
 		return SealResult::success();
 #else
+		secureJob(job);
 		delete job;
 		return SealResult::failure(SealCode::InvalidArgument, "async requires ESP32");
 #endif
@@ -588,6 +643,12 @@ struct SealImpl {
 	void secureJob(SealJob *job) {
 		if (job == nullptr) {
 			return;
+		}
+		if (!job->payloadJson.empty()) {
+			seal::internal::secureClear(job->payloadJson.data(), job->payloadJson.size());
+		}
+		if (!job->token.empty()) {
+			seal::internal::secureClear(job->token.data(), job->token.size());
 		}
 		if (!job->secret.empty()) {
 			seal::internal::secureClear(job->secret.data(), job->secret.size());
@@ -599,15 +660,33 @@ struct SealImpl {
 		static_cast<SealImpl *>(arg)->runTask();
 	}
 
+	bool shouldStopWorker() {
+		SealLock lock(mutex, config.useMutex);
+		return !lock || stopRequested || lifecycle != SealLifecycle::Running;
+	}
+
+	void beginCallback() {
+		SealLock lock(mutex, config.useMutex);
+		if (lock && callbackDepth < std::numeric_limits<uint16_t>::max()) {
+			++callbackDepth;
+		}
+	}
+
+	void endCallback() {
+		SealLock lock(mutex, config.useMutex);
+		if (lock && callbackDepth > 0) {
+			--callbackDepth;
+		}
+	}
+
 	void runTask() {
 		while (true) {
-			SealJob *job = nullptr;
-			if (xQueueReceive(queue, &job, portMAX_DELAY) != pdTRUE || job == nullptr) {
-				continue;
-			}
-			if (job->type == SealJobType::Stop) {
-				delete job;
+			if (shouldStopWorker()) {
 				break;
+			}
+			SealJob *job = nullptr;
+			if (xQueueReceive(queue, &job, pdMS_TO_TICKS(50)) != pdTRUE || job == nullptr) {
+				continue;
 			}
 
 			if (job->type == SealJobType::Sign) {
@@ -618,40 +697,65 @@ struct SealImpl {
 				}
 				SealToken token;
 				if (result) {
-					std::string tokenValue;
-					result = buildSignedToken(payload, job->signOptions, job->secret.c_str(), tokenValue);
-					if (result) {
-						result = allocateToken(tokenValue, token);
+					SealLock lock(mutex, config.useMutex);
+					if (!lock) {
+						result = SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+					} else {
+						std::string tokenValue;
+						result = buildSignedToken(payload, job->signOptions, job->secret.c_str(), tokenValue);
+						if (result) {
+							result = allocateToken(tokenValue, token);
+						}
 					}
 				}
-				inCallback = true;
+				beginCallback();
 				if (job->signCallback) {
 					job->signCallback(result, std::move(token));
 				}
-				inCallback = false;
+				endCallback();
 			} else if (job->type == SealJobType::Verify) {
 				JsonDocument payload;
-				SealResult result =
-				    verifyToken(job->token.c_str(), job->secret.c_str(), job->verifyOptions, payload);
-				inCallback = true;
+				SealResult result = SealResult::success();
+				{
+					SealLock lock(mutex, config.useMutex);
+					if (!lock) {
+						result = SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+					} else {
+						result =
+						    verifyToken(job->token.c_str(), job->secret.c_str(), job->verifyOptions, payload);
+					}
+				}
+				beginCallback();
 				if (job->verifyCallback) {
 					job->verifyCallback(result, payload);
 				}
-				inCallback = false;
+				endCallback();
 			} else if (job->type == SealJobType::Decode) {
 				JsonDocument payload;
-				SealResult result = decodeParts(job->token.c_str(), nullptr, &payload);
-				inCallback = true;
+				SealResult result = SealResult::success();
+				{
+					SealLock lock(mutex, config.useMutex);
+					if (!lock) {
+						result = SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+					} else if (lifecycle != SealLifecycle::Running) {
+						result = resultForLifecycle(lifecycle);
+					} else {
+						result = decodeParts(job->token.c_str(), nullptr, &payload);
+					}
+				}
+				beginCallback();
 				if (job->decodeCallback) {
 					job->decodeCallback(result, payload);
 				}
-				inCallback = false;
+				endCallback();
 			}
 
 			secureJob(job);
 			delete job;
 		}
-		task = nullptr;
+		if (doneSignal != nullptr) {
+			xSemaphoreGive(doneSignal);
+		}
 		seal::internal::task::deleteCurrentTask(taskCreatedWithCaps);
 	}
 #endif
@@ -717,8 +821,11 @@ SealResult Seal::init(const SealConfig &config) {
 	if (!lock) {
 		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 	}
-	if (_impl->initialized) {
+	if (_impl->lifecycle == SealLifecycle::Running) {
 		return SealResult::failure(SealCode::AlreadyInitialized, "seal is already initialized");
+	}
+	if (_impl->lifecycle == SealLifecycle::Stopping) {
+		return SealResult::failure(SealCode::Busy, "seal is stopping");
 	}
 	SealResult result = validateConfig(config);
 	if (!result) {
@@ -727,12 +834,23 @@ SealResult Seal::init(const SealConfig &config) {
 	_impl->config = config;
 	_impl->fixedClockTimestamp = 0;
 	_impl->useFixedClockTimestamp = false;
+	_impl->stopRequested = false;
+	_impl->callbackDepth = 0;
+	_impl->lifecycle = SealLifecycle::Running;
 
 #if defined(ESP32)
 	if (config.enableAsync) {
 		_impl->queue = xQueueCreate(config.queueSize, sizeof(SealJob *));
 		if (_impl->queue == nullptr) {
+			_impl->lifecycle = SealLifecycle::Stopped;
 			return SealResult::failure(SealCode::AllocationFailed, "seal queue allocation failed");
+		}
+		_impl->doneSignal = xSemaphoreCreateBinary();
+		if (_impl->doneSignal == nullptr) {
+			vQueueDelete(_impl->queue);
+			_impl->queue = nullptr;
+			_impl->lifecycle = SealLifecycle::Stopped;
+			return SealResult::failure(SealCode::AllocationFailed, "seal shutdown signal allocation failed");
 		}
 		bool usePsramStack =
 		    config.stackType == SealStackType::Psram ||
@@ -764,12 +882,14 @@ SealResult Seal::init(const SealConfig &config) {
 		if (created != pdPASS) {
 			vQueueDelete(_impl->queue);
 			_impl->queue = nullptr;
+			vSemaphoreDelete(_impl->doneSignal);
+			_impl->doneSignal = nullptr;
+			_impl->lifecycle = SealLifecycle::Stopped;
 			return SealResult::failure(SealCode::AllocationFailed, "seal task creation failed");
 		}
 	}
 #endif
 
-	_impl->initialized = true;
 	return SealResult::success();
 }
 
@@ -777,46 +897,90 @@ SealResult Seal::deinit() {
 	if (!_impl) {
 		return SealResult::success();
 	}
-	SealLock lock(_impl->mutex, _impl->config.useMutex);
-	if (!lock) {
-		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
-	}
-	if (!_impl->initialized) {
-		return SealResult::success();
-	}
-	if (_impl->inCallback) {
-		return SealResult::failure(SealCode::Busy, "cannot deinit seal from callback");
+#if defined(ESP32)
+	QueueHandle_t queueToDelete = nullptr;
+	SemaphoreHandle_t doneSignalToDelete = nullptr;
+	bool waitForWorker = false;
+#endif
+
+	{
+		SealLock lock(_impl->mutex, _impl->config.useMutex);
+		if (!lock) {
+			return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+		}
+		if (_impl->lifecycle == SealLifecycle::Stopped) {
+			return SealResult::success();
+		}
+		if (_impl->callbackDepth > 0) {
+			return SealResult::failure(SealCode::Busy, "cannot deinit seal from callback");
+		}
+#if defined(ESP32)
+		if (_impl->task != nullptr && xTaskGetCurrentTaskHandle() == _impl->task) {
+			return SealResult::failure(SealCode::Busy, "cannot deinit seal from worker task");
+		}
+		if (_impl->queue != nullptr && _impl->task != nullptr) {
+			_impl->lifecycle = SealLifecycle::Stopping;
+			_impl->stopRequested = true;
+			waitForWorker = true;
+		} else {
+			_impl->lifecycle = SealLifecycle::Stopped;
+		}
+#else
+		_impl->lifecycle = SealLifecycle::Stopped;
+#endif
 	}
 
 #if defined(ESP32)
-	if (_impl->queue != nullptr) {
-		SealJob *stopJob = new (std::nothrow) SealJob();
-		if (stopJob != nullptr) {
-			stopJob->type = SealJobType::Stop;
-			xQueueSend(_impl->queue, &stopJob, pdMS_TO_TICKS(100));
+	if (waitForWorker) {
+		if (_impl->doneSignal == nullptr ||
+		    xSemaphoreTake(_impl->doneSignal, pdMS_TO_TICKS(2000)) != pdTRUE) {
+			return SealResult::failure(SealCode::Busy, "seal worker did not stop");
 		}
-		for (uint32_t i = 0; i < 200 && _impl->task != nullptr; ++i) {
-			vTaskDelay(pdMS_TO_TICKS(10));
+
+		SealLock lock(_impl->mutex, _impl->config.useMutex);
+		if (!lock) {
+			return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 		}
 		SealJob *queued = nullptr;
 		while (xQueueReceive(_impl->queue, &queued, 0) == pdTRUE) {
 			_impl->secureJob(queued);
 			delete queued;
 		}
-		vQueueDelete(_impl->queue);
+		queueToDelete = _impl->queue;
+		doneSignalToDelete = _impl->doneSignal;
 		_impl->queue = nullptr;
+		_impl->doneSignal = nullptr;
 		_impl->task = nullptr;
+		_impl->taskCreatedWithCaps = false;
+		_impl->stopRequested = false;
+		_impl->lifecycle = SealLifecycle::Stopped;
+	}
+
+	if (queueToDelete != nullptr) {
+		vQueueDelete(queueToDelete);
+	}
+	if (doneSignalToDelete != nullptr) {
+		vSemaphoreDelete(doneSignalToDelete);
 	}
 #endif
 
-	_impl->timeProvider = nullptr;
-	_impl->initialized = false;
-	_impl->useFixedClockTimestamp = false;
+	{
+		SealLock lock(_impl->mutex, _impl->config.useMutex);
+		if (!lock) {
+			return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+		}
+		_impl->timeProvider = nullptr;
+		_impl->useFixedClockTimestamp = false;
+	}
 	return SealResult::success();
 }
 
 bool Seal::initialized() const {
-	return _impl && _impl->initialized;
+	if (!_impl) {
+		return false;
+	}
+	SealLock lock(_impl->mutex, _impl->config.useMutex);
+	return lock && _impl->lifecycle == SealLifecycle::Running;
 }
 
 SealResult Seal::setTimeProvider(SealTimeProvider provider) {
@@ -826,6 +990,9 @@ SealResult Seal::setTimeProvider(SealTimeProvider provider) {
 	SealLock lock(_impl->mutex, _impl->config.useMutex);
 	if (!lock) {
 		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+	}
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
 	}
 	_impl->timeProvider = std::move(provider);
 	return SealResult::success();
@@ -839,6 +1006,9 @@ SealResult Seal::setClockTimestamp(uint64_t epochSeconds) {
 	if (!lock) {
 		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 	}
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
+	}
 	_impl->fixedClockTimestamp = epochSeconds;
 	_impl->useFixedClockTimestamp = true;
 	return SealResult::success();
@@ -851,6 +1021,9 @@ SealResult Seal::clearClockTimestamp() {
 	SealLock lock(_impl->mutex, _impl->config.useMutex);
 	if (!lock) {
 		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+	}
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
 	}
 	_impl->fixedClockTimestamp = 0;
 	_impl->useFixedClockTimestamp = false;
@@ -873,6 +1046,9 @@ SealResult Seal::sign(
 	SealLock lock(_impl->mutex, _impl->config.useMutex);
 	if (!lock) {
 		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+	}
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
 	}
 	std::string token;
 	SealResult result = _impl->buildSignedToken(payload, options, secret, token);
@@ -900,6 +1076,9 @@ SealResult Seal::sign(
 	SealLock lock(_impl->mutex, _impl->config.useMutex);
 	if (!lock) {
 		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+	}
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
 	}
 	std::string token;
 	SealResult result = _impl->buildSignedToken(payload, options, secret, token);
@@ -931,6 +1110,9 @@ SealResult Seal::verify(
 	if (!lock) {
 		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 	}
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
+	}
 	return _impl->verifyToken(token, secret, options, outPayload);
 }
 
@@ -942,8 +1124,8 @@ SealResult Seal::decode(const char *token, JsonDocument &outPayload) {
 	if (!lock) {
 		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 	}
-	if (!_impl->initialized) {
-		return SealResult::failure(SealCode::NotInitialized, "seal is not initialized");
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
 	}
 	return _impl->decodeParts(token, nullptr, &outPayload);
 }
@@ -956,8 +1138,8 @@ SealResult Seal::decodeHeader(const char *token, JsonDocument &outHeader) {
 	if (!lock) {
 		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 	}
-	if (!_impl->initialized) {
-		return SealResult::failure(SealCode::NotInitialized, "seal is not initialized");
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
 	}
 	return _impl->decodeParts(token, &outHeader, nullptr);
 }
@@ -974,8 +1156,8 @@ SealResult Seal::decodeComplete(
 	if (!lock) {
 		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 	}
-	if (!_impl->initialized) {
-		return SealResult::failure(SealCode::NotInitialized, "seal is not initialized");
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
 	}
 	return _impl->decodeParts(token, &outHeader, &outPayload);
 }
@@ -997,8 +1179,12 @@ SealResult Seal::sign(
 	if (!_impl) {
 		return SealResult::failure(SealCode::AllocationFailed, "seal implementation allocation failed");
 	}
-	if (!_impl->initialized) {
-		return SealResult::failure(SealCode::NotInitialized, "seal is not initialized");
+	SealLock lock(_impl->mutex, _impl->config.useMutex);
+	if (!lock) {
+		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+	}
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
 	}
 	if (!callback) {
 		return SealResult::failure(SealCode::InvalidArgument, "sign callback is required");
@@ -1040,8 +1226,12 @@ SealResult Seal::verify(
 	if (!_impl) {
 		return SealResult::failure(SealCode::AllocationFailed, "seal implementation allocation failed");
 	}
-	if (!_impl->initialized) {
-		return SealResult::failure(SealCode::NotInitialized, "seal is not initialized");
+	SealLock lock(_impl->mutex, _impl->config.useMutex);
+	if (!lock) {
+		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+	}
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
 	}
 	if (!callback) {
 		return SealResult::failure(SealCode::InvalidArgument, "verify callback is required");
@@ -1068,8 +1258,12 @@ SealResult Seal::decode(const char *token, SealDecodeCallback callback) {
 	if (!_impl) {
 		return SealResult::failure(SealCode::AllocationFailed, "seal implementation allocation failed");
 	}
-	if (!_impl->initialized) {
-		return SealResult::failure(SealCode::NotInitialized, "seal is not initialized");
+	SealLock lock(_impl->mutex, _impl->config.useMutex);
+	if (!lock) {
+		return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
+	}
+	if (_impl->lifecycle != SealLifecycle::Running) {
+		return resultForLifecycle(_impl->lifecycle);
 	}
 	if (!callback) {
 		return SealResult::failure(SealCode::InvalidArgument, "decode callback is required");
