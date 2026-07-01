@@ -144,7 +144,7 @@ For the full API, see [`docs/api.md`](docs/api.md).
 | Algorithms   | HS256                      |
 | Dependencies | ArduinoJson v7, mbedTLS    |
 | Exceptions   | Not used                   |
-| Status       | Experimental               |
+| Status       | Early-stage `0.1.0` 		|
 
 ## jsonwebtoken Compatibility
 
