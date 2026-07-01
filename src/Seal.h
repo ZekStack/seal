@@ -210,5 +210,8 @@ class Seal {
 	const char *cryptoBackendName() const;
 
   private:
+#if defined(ESP32)
+	SealResult deinitInternal(TickType_t waitTicks, bool fromDestructor);
+#endif
 	std::unique_ptr<SealImpl> _impl;
 };

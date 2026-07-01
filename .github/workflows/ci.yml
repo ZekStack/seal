@@ -86,6 +86,25 @@ jobs:
             -o /tmp/seal-jwt-tests
           /tmp/seal-jwt-tests
 
+      - name: Build and run ESP32 lifecycle host tests
+        run: |
+          g++ -std=c++20 -Wall -Wextra -pedantic \
+            -DESP32 \
+            -DSEAL_HOST_CRYPTO_OPENSSL \
+            -I/tmp/ArduinoJson-7.4.3/src \
+            -Itests/host/esp32_stubs \
+            -Isrc \
+            src/Seal.cpp \
+            src/internal/SealBase64Url.cpp \
+            src/internal/SealCrypto.cpp \
+            tests/host/SealCryptoHostOpenSsl.cpp \
+            tests/host/SealHostFreeRtos.cpp \
+            tests/host/test_seal_esp32_lifecycle.cpp \
+            -lcrypto \
+            -pthread \
+            -o /tmp/seal-esp32-lifecycle-tests
+          /tmp/seal-esp32-lifecycle-tests
+
       - name: Run Node jsonwebtoken compatibility tests
         run: |
           g++ -std=c++20 -Wall -Wextra -pedantic \
