@@ -832,12 +832,20 @@ Seal::Seal() : _impl(new (std::nothrow) SealImpl()) {
 
 Seal::~Seal() {
 #if defined(ESP32)
-	if (_impl && _impl->destructionWouldDeadlock()) {
+	if (!_impl) {
+		return;
+	}
+	if (_impl->destructionWouldDeadlock()) {
 		_impl->requestStopWithoutJoin();
 		_impl.release();
 		return;
 	}
-	(void)deinitInternal(portMAX_DELAY, true);
+	SealResult result = deinitInternal(portMAX_DELAY, true);
+	if (!result && result.code == SealCode::Busy) {
+		_impl->requestStopWithoutJoin();
+		_impl.release();
+		return;
+	}
 #else
 	deinit();
 #endif
@@ -959,7 +967,8 @@ SealResult Seal::deinit() {
 
 #if defined(ESP32)
 SealResult Seal::deinitInternal(TickType_t waitTicks, bool fromDestructor) {
-	if (!_impl) {
+	SealImpl *impl = _impl.get();
+	if (impl == nullptr) {
 		return SealResult::success();
 	}
 
@@ -969,76 +978,76 @@ SealResult Seal::deinitInternal(TickType_t waitTicks, bool fromDestructor) {
 	SemaphoreHandle_t doneSignalToWait = nullptr;
 
 	{
-		SealLock lock(_impl->mutex, _impl->config.useMutex);
+		SealLock lock(impl->mutex, impl->config.useMutex);
 		if (!lock) {
 			return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 		}
-		if (_impl->lifecycle == SealLifecycle::Stopped) {
+		if (impl->lifecycle == SealLifecycle::Stopped) {
 			return SealResult::success();
 		}
-		if (_impl->callbackDepth > 0) {
+		if (impl->callbackDepth > 0) {
 			return SealResult::failure(SealCode::Busy, "cannot deinit seal from callback");
 		}
-		if (_impl->task != nullptr && xTaskGetCurrentTaskHandle() == _impl->task) {
+		if (impl->task != nullptr && xTaskGetCurrentTaskHandle() == impl->task) {
 			return SealResult::failure(SealCode::Busy, "cannot deinit seal from worker task");
 		}
 
-		if (_impl->lifecycle == SealLifecycle::Stopping && _impl->shutdownWaitInProgress) {
+		if (impl->lifecycle == SealLifecycle::Stopping && impl->shutdownWaitInProgress) {
 			return SealResult::failure(SealCode::Busy, "seal shutdown already in progress");
 		}
 
-		if (_impl->lifecycle == SealLifecycle::Running && _impl->queue != nullptr &&
-		    _impl->task != nullptr) {
-			_impl->lifecycle = SealLifecycle::Stopping;
-			_impl->stopRequested = true;
-			_impl->shutdownWaitInProgress = true;
+		if (impl->lifecycle == SealLifecycle::Running && impl->queue != nullptr &&
+		    impl->task != nullptr) {
+			impl->lifecycle = SealLifecycle::Stopping;
+			impl->stopRequested = true;
+			impl->shutdownWaitInProgress = true;
 			waitForWorker = true;
-			doneSignalToWait = _impl->doneSignal;
-		} else if (_impl->lifecycle == SealLifecycle::Stopping && _impl->queue != nullptr &&
-		           _impl->task != nullptr) {
-			_impl->shutdownWaitInProgress = true;
+			doneSignalToWait = impl->doneSignal;
+		} else if (impl->lifecycle == SealLifecycle::Stopping && impl->queue != nullptr &&
+		           impl->task != nullptr) {
+			impl->shutdownWaitInProgress = true;
 			waitForWorker = true;
-			doneSignalToWait = _impl->doneSignal;
+			doneSignalToWait = impl->doneSignal;
 		} else {
-			_impl->lifecycle = SealLifecycle::Stopped;
-			_impl->stopRequested = false;
-			_impl->shutdownWaitInProgress = false;
-			_impl->timeProvider = nullptr;
-			_impl->useFixedClockTimestamp = false;
+			impl->lifecycle = SealLifecycle::Stopped;
+			impl->stopRequested = false;
+			impl->shutdownWaitInProgress = false;
+			impl->timeProvider = nullptr;
+			impl->useFixedClockTimestamp = false;
 		}
 	}
 
 	if (waitForWorker) {
 		if (doneSignalToWait == nullptr || xSemaphoreTake(doneSignalToWait, waitTicks) != pdTRUE) {
-			SealLock lock(_impl->mutex, _impl->config.useMutex);
+			SealLock lock(impl->mutex, impl->config.useMutex);
 			if (!lock) {
 				return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 			}
-			_impl->shutdownWaitInProgress = false;
-			_impl->stopRequested = true;
+			impl->shutdownWaitInProgress = false;
+			impl->stopRequested = true;
 			return SealResult::failure(SealCode::Busy, "seal worker did not stop");
 		}
 
-		SealLock lock(_impl->mutex, _impl->config.useMutex);
+		SealLock lock(impl->mutex, impl->config.useMutex);
 		if (!lock) {
 			return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 		}
 		SealJob *queued = nullptr;
-		while (xQueueReceive(_impl->queue, &queued, 0) == pdTRUE) {
-			_impl->secureJob(queued);
+		while (xQueueReceive(impl->queue, &queued, 0) == pdTRUE) {
+			impl->secureJob(queued);
 			delete queued;
 		}
-		queueToDelete = _impl->queue;
-		doneSignalToDelete = _impl->doneSignal;
-		_impl->queue = nullptr;
-		_impl->doneSignal = nullptr;
-		_impl->task = nullptr;
-		_impl->taskCreatedWithCaps = false;
-		_impl->shutdownWaitInProgress = false;
-		_impl->stopRequested = false;
-		_impl->lifecycle = SealLifecycle::Stopped;
-		_impl->timeProvider = nullptr;
-		_impl->useFixedClockTimestamp = false;
+		queueToDelete = impl->queue;
+		doneSignalToDelete = impl->doneSignal;
+		impl->queue = nullptr;
+		impl->doneSignal = nullptr;
+		impl->task = nullptr;
+		impl->taskCreatedWithCaps = false;
+		impl->shutdownWaitInProgress = false;
+		impl->stopRequested = false;
+		impl->lifecycle = SealLifecycle::Stopped;
+		impl->timeProvider = nullptr;
+		impl->useFixedClockTimestamp = false;
 	}
 
 	if (queueToDelete != nullptr) {

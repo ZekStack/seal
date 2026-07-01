@@ -245,6 +245,40 @@ void testConcurrentDeinitSingleWaiter() {
 	expect(firstCode.load() == SealCode::Ok, "first deinit succeeds");
 }
 
+void testDestructorBusyFallbackWhileDeinitWaits() {
+	seal::host::freertos::reset();
+	seal::host::freertos::setDoneSignalStalled(true);
+
+	auto *seal = new Seal();
+	expect(seal->init(testConfig()), "destructor busy fallback init");
+	const uint32_t queueDeletesBefore = seal::host::freertos::queueDeleteCount();
+	const uint32_t binaryDeletesBefore = seal::host::freertos::binarySemaphoreDeleteCount();
+	std::atomic<SealCode> deinitCode{SealCode::Ok};
+	std::thread waiter([&] {
+		deinitCode = seal->deinit().code;
+	});
+
+	expect(seal::host::freertos::waitForBinarySemaphoreWaiter(200), "deinit waiter is active");
+	std::atomic<bool> destroyed{false};
+	std::thread destroyer([&] {
+		delete seal;
+		destroyed = true;
+	});
+
+	expect(waitUntil([&] {
+		return destroyed.load();
+	}), "destructor falls back after Busy");
+	expect(seal::host::freertos::queueDeleteCount() == queueDeletesBefore,
+	    "destructor Busy fallback does not delete queue handle");
+	expect(seal::host::freertos::binarySemaphoreDeleteCount() == binaryDeletesBefore,
+	    "destructor Busy fallback does not delete done signal handle");
+
+	seal::host::freertos::setDoneSignalStalled(false);
+	destroyer.join();
+	waiter.join();
+	expect(deinitCode.load() == SealCode::Ok, "original deinit waiter succeeds");
+}
+
 void testDestructorBlocksUntilWorkerStops() {
 	seal::host::freertos::reset();
 	seal::host::freertos::setDoneSignalStalled(true);
@@ -292,6 +326,7 @@ int main() {
 	testSubmitAfterStoppingAndTimeoutRetry();
 	testSubmitWhileDeinitWaits();
 	testConcurrentDeinitSingleWaiter();
+	testDestructorBusyFallbackWhileDeinitWaits();
 	testDestructorBlocksUntilWorkerStops();
 	testDestructorDeadlockFallbackFromCallback();
 
