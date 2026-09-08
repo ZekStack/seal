@@ -422,6 +422,11 @@ void vTaskSuspend(TaskHandle_t task) {
 	if (target == nullptr || target == &gMainTask) {
 		return;
 	}
+	if (task == nullptr && target == gCurrentTask) {
+		target->finished = true;
+		gCurrentTask = nullptr;
+		pthread_exit(nullptr);
+	}
 	std::unique_lock<std::mutex> lock(gControlMutex);
 	gControlCv.wait(lock, [target] {
 		return target->deleteRequested.load();
