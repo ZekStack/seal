@@ -1,55 +1,51 @@
 #pragma once
 
 #if defined(ESP32)
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
+#include <strata/freertos/Mutex.h>
 #endif
 
 class SealMutex {
   public:
-	SealMutex() {
+	SealMutex() noexcept {
 #if defined(ESP32)
-		_handle = xSemaphoreCreateRecursiveMutex();
-#endif
-	}
-
-	~SealMutex() {
-#if defined(ESP32)
-		if (_handle != nullptr) {
-			vSemaphoreDelete(_handle);
-			_handle = nullptr;
-		}
+		_mutex = Strata::FreeRTOS::RecursiveMutex::create();
 #endif
 	}
 
 	SealMutex(const SealMutex &) = delete;
 	SealMutex &operator=(const SealMutex &) = delete;
 
-	bool lock() {
+	bool valid() const noexcept {
 #if defined(ESP32)
-		return _handle != nullptr && xSemaphoreTakeRecursive(_handle, portMAX_DELAY) == pdTRUE;
+		return _mutex.valid();
 #else
 		return true;
 #endif
 	}
 
-	void unlock() {
+	bool lock() noexcept {
 #if defined(ESP32)
-		if (_handle != nullptr) {
-			xSemaphoreGiveRecursive(_handle);
-		}
+		return _mutex.lock();
+#else
+		return true;
+#endif
+	}
+
+	void unlock() noexcept {
+#if defined(ESP32)
+		_mutex.unlock();
 #endif
 	}
 
   private:
 #if defined(ESP32)
-	SemaphoreHandle_t _handle = nullptr;
+	Strata::FreeRTOS::RecursiveMutex _mutex;
 #endif
 };
 
 class SealLock {
   public:
-	SealLock(SealMutex &mutex, bool enabled)
+	SealLock(SealMutex &mutex, bool enabled) noexcept
 	    : _mutex(mutex), _enabled(enabled), _locked(!enabled || mutex.lock()) {
 	}
 
@@ -62,7 +58,7 @@ class SealLock {
 	SealLock(const SealLock &) = delete;
 	SealLock &operator=(const SealLock &) = delete;
 
-	explicit operator bool() const {
+	explicit operator bool() const noexcept {
 		return _locked;
 	}
 

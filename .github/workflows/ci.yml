@@ -15,6 +15,7 @@ env:
   PIOARDUINO_PLATFORM_URL: https://github.com/pioarduino/platform-espressif32/releases/download/55.03.39/platform-espressif32.zip
   PIOARDUINO_PLATFORM_VERSION: 55.03.39
   PIOARDUINO_VERSION: 6.1.19
+  STRATA_VERSION: v0.1.2
 
 jobs:
   source-audit:
@@ -25,6 +26,7 @@ jobs:
 
       - name: Audit production sources
         run: |
+          set -e
           if grep -RInE '(^|[^[:alnum:]_])throw([^[:alnum:]_]|$)|std::abort[[:space:]]*\(' src; then
             echo "Embedded safety audit failed"
             exit 1
@@ -37,6 +39,18 @@ jobs:
             echo "Seal must not depend on other ZekStack libraries"
             exit 1
           fi
+          if grep -RInE 'heap_caps_|MALLOC_CAP_|ps_malloc|xTaskCreate|vTaskDelete|xQueueCreate|vQueueDelete|xSemaphoreCreate|vSemaphoreDelete|std::make_unique|std::make_shared|(^|[^:[:alnum:]_])malloc[[:space:]]*\(|(^|[^:[:alnum:]_])calloc[[:space:]]*\(|(^|[^:[:alnum:]_])realloc[[:space:]]*\(|(^|[^:[:alnum:]_])free[[:space:]]*\(|(^|[^[:alnum:]_])new[[:space:](]|(^|[^[:alnum:]_])delete[[:space:](]' src; then
+            echo "Seal allocations and owned FreeRTOS primitives must route through Strata"
+            exit 1
+          fi
+          if grep -RInE '#include[[:space:]]+[<"]esp_heap_caps\.h[>"]|freertos/idf_additions\.h' src; then
+            echo "Seal must not depend on ESP-IDF allocation internals"
+            exit 1
+          fi
+          if grep -RInE 'std::string|std::vector' src; then
+            echo "Seal-owned STL storage must use Strata allocators"
+            exit 1
+          fi
 
   host-internal-tests:
     runs-on: [self-hosted, zekstack-ci]
@@ -45,10 +59,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install host test dependencies
+        run: |
+          set -e
+          curl -L -o /tmp/ArduinoJson-7.4.3.tar.gz \
+            https://github.com/bblanchon/ArduinoJson/archive/refs/tags/v7.4.3.tar.gz
+          rm -rf /tmp/ArduinoJson-7.4.3
+          mkdir -p /tmp/ArduinoJson-7.4.3
+          tar -xzf /tmp/ArduinoJson-7.4.3.tar.gz \
+            -C /tmp/ArduinoJson-7.4.3 \
+            --strip-components=1
+          rm -rf "/tmp/Strata-${STRATA_VERSION}"
+          git clone --depth 1 --branch "${STRATA_VERSION}" \
+            https://github.com/ZekStack/strata.git \
+            "/tmp/Strata-${STRATA_VERSION}"
+          npm install jsonwebtoken@9.0.3
+
       - name: Build and run host internal tests
         run: |
+          STRATA_DIR="/tmp/Strata-${STRATA_VERSION}"
           g++ -std=c++20 -Wall -Wextra -pedantic \
             -DSEAL_HOST_CRYPTO_OPENSSL \
+            -I"$STRATA_DIR/src" \
             -Itests/host/stubs \
             -Isrc \
             src/internal/SealBase64Url.cpp \
@@ -59,27 +96,20 @@ jobs:
             -o /tmp/seal-host-tests
           /tmp/seal-host-tests
 
-      - name: Install host test dependencies
-        run: |
-          set -e
-          curl -L -o /tmp/ArduinoJson-7.4.3.tar.gz \
-            https://github.com/bblanchon/ArduinoJson/archive/refs/tags/v7.4.3.tar.gz
-          mkdir -p /tmp/ArduinoJson-7.4.3
-          tar -xzf /tmp/ArduinoJson-7.4.3.tar.gz \
-            -C /tmp/ArduinoJson-7.4.3 \
-            --strip-components=1
-          npm install jsonwebtoken@9.0.3
-
       - name: Build and run host JWT tests
         run: |
+          STRATA_DIR="/tmp/Strata-${STRATA_VERSION}"
           g++ -std=c++20 -Wall -Wextra -pedantic \
             -DSEAL_HOST_CRYPTO_OPENSSL \
             -I/tmp/ArduinoJson-7.4.3/src \
+            -I"$STRATA_DIR/src" \
             -Itests/host/stubs \
             -Isrc \
             src/Seal.cpp \
             src/internal/SealBase64Url.cpp \
             src/internal/SealCrypto.cpp \
+            "$STRATA_DIR/src/strata/Allocation.cpp" \
+            "$STRATA_DIR/src/strata/internal/PlatformGeneric.cpp" \
             tests/host/SealCryptoHostOpenSsl.cpp \
             tests/host/test_seal_jwt.cpp \
             -lcrypto \
@@ -88,15 +118,19 @@ jobs:
 
       - name: Build and run ESP32 lifecycle host tests
         run: |
+          STRATA_DIR="/tmp/Strata-${STRATA_VERSION}"
           g++ -std=c++20 -Wall -Wextra -pedantic \
             -DESP32 \
             -DSEAL_HOST_CRYPTO_OPENSSL \
             -I/tmp/ArduinoJson-7.4.3/src \
+            -I"$STRATA_DIR/src" \
             -Itests/host/esp32_stubs \
             -Isrc \
             src/Seal.cpp \
             src/internal/SealBase64Url.cpp \
             src/internal/SealCrypto.cpp \
+            "$STRATA_DIR/src/strata/Allocation.cpp" \
+            tests/host/StrataHostEsp32Backend.cpp \
             tests/host/SealCryptoHostOpenSsl.cpp \
             tests/host/SealHostFreeRtos.cpp \
             tests/host/test_seal_esp32_lifecycle.cpp \
@@ -107,14 +141,18 @@ jobs:
 
       - name: Run Node jsonwebtoken compatibility tests
         run: |
+          STRATA_DIR="/tmp/Strata-${STRATA_VERSION}"
           g++ -std=c++20 -Wall -Wextra -pedantic \
             -DSEAL_HOST_CRYPTO_OPENSSL \
             -I/tmp/ArduinoJson-7.4.3/src \
+            -I"$STRATA_DIR/src" \
             -Itests/host/stubs \
             -Isrc \
             src/Seal.cpp \
             src/internal/SealBase64Url.cpp \
             src/internal/SealCrypto.cpp \
+            "$STRATA_DIR/src/strata/Allocation.cpp" \
+            "$STRATA_DIR/src/strata/internal/PlatformGeneric.cpp" \
             tests/host/SealCryptoHostOpenSsl.cpp \
             tests/host/seal_compat_cli.cpp \
             -lcrypto \
@@ -163,6 +201,7 @@ jobs:
                 --board ${{ matrix.board }} \
                 --lib="." \
                 --project-option "platform=${PIOARDUINO_PLATFORM_URL}" \
+                --project-option "lib_deps=https://github.com/ZekStack/strata.git#${STRATA_VERSION}" \
                 --project-option "build_unflags=-std=gnu++11" \
                 --project-option "build_flags=-std=gnu++20"
             fi
@@ -246,12 +285,16 @@ jobs:
       - name: Install ArduinoJson
         run: arduino-cli lib install "ArduinoJson@7.4.3"
 
-      - name: Add local library to sketchbook
+      - name: Add local libraries to sketchbook
         run: |
           set -e
           SKETCHBOOK_DIR="${HOME}/Arduino"
           mkdir -p "$SKETCHBOOK_DIR/libraries/Seal"
           rsync -a --delete --exclude ".git" ./ "$SKETCHBOOK_DIR/libraries/Seal/"
+          rm -rf "$SKETCHBOOK_DIR/libraries/Strata"
+          git clone --depth 1 --branch "${STRATA_VERSION}" \
+            https://github.com/ZekStack/strata.git \
+            "$SKETCHBOOK_DIR/libraries/Strata"
 
       - name: Build examples (${{ matrix.board.name }})
         env:

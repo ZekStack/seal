@@ -2,10 +2,11 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <Strata.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <memory>
 
 #if defined(ESP32)
 #include <freertos/FreeRTOS.h>
@@ -51,12 +52,6 @@ enum class SealAlgorithm : uint8_t {
 	HS256,
 };
 
-enum class SealStackType : uint8_t {
-	Auto,
-	Internal,
-	Psram,
-};
-
 struct SealResult {
 	SealCode code = SealCode::Ok;
 	const char *message = "ok";
@@ -81,6 +76,11 @@ struct SealResult {
 };
 
 struct SealConfig {
+	Strata::MemoryPolicy memory{
+	    .allocation = Strata::Placement::PreferExternal,
+	    .taskStack = Strata::Placement::PreferExternal,
+	};
+
 	size_t maxTokenSize = 4096;
 	size_t maxPayloadSize = 2048;
 	size_t maxHeaderSize = 512;
@@ -89,10 +89,8 @@ struct SealConfig {
 	size_t stackSizeBytes = 4096;
 	UBaseType_t priority = 1;
 	BaseType_t coreId = tskNO_AFFINITY;
-	SealStackType stackType = SealStackType::Auto;
 	bool enableAsync = true;
 	bool useMutex = true;
-	bool preferPsram = true;
 	bool addIssuedAtByDefault = true;
 };
 
@@ -213,5 +211,5 @@ class Seal {
 #if defined(ESP32)
 	SealResult deinitInternal(TickType_t waitTicks, bool fromDestructor);
 #endif
-	std::unique_ptr<SealImpl> _impl;
+	Strata::UniquePtr<SealImpl> _impl;
 };

@@ -6,11 +6,21 @@ Seal exposes a small result-based API through `<Seal.h>`.
 
 `SealResult` contains a `SealCode` and message. It converts to `true` only when the code is `SealCode::Ok`.
 
-`SealToken` owns generated token memory and is move-only.
+`SealToken` owns generated token memory and is move-only. Its owned token buffer is allocated according to `SealConfig::memory.allocation` and securely cleared before release.
 
 `SealOptions` controls signing claims: `iat`, `exp`, `nbf`, `issuer`, `subject`, `audience`, `jwtid`, and `keyid`.
 
 `SealVerifyOptions` controls expected claims, expiration behavior, clock tolerance, explicit clock timestamp, and `maxAgeSeconds`.
+
+`SealConfig` contains the shared ZekStack `Strata::MemoryPolicy`:
+
+```cpp
+SealConfig config;
+config.memory.allocation = Strata::Placement::PreferExternal;
+config.memory.taskStack = Strata::Placement::PreferExternal;
+```
+
+See `configuration.md` and `memory.md` for the complete placement contract.
 
 ## Signing
 
@@ -26,6 +36,8 @@ Signing produces compact JWT serialization:
 base64url(header).base64url(payload).base64url(signature)
 ```
 
+The caller-buffer overload does not transfer ownership of the supplied buffer to Seal.
+
 ## Verification
 
 ```cpp
@@ -34,6 +46,8 @@ SealResult verify(const char* token, const char* secret, const SealVerifyOptions
 ```
 
 Verification requires exactly three token segments, `alg` equal to `HS256`, a non-empty signature, valid JSON, a matching HMAC-SHA256 signature, and matching configured claims. The `typ` header is ignored by default for interoperability.
+
+Caller-provided output `JsonDocument` objects retain their caller-selected allocator. Seal's intermediate JSON documents use the configured Strata allocation placement.
 
 ## Decode
 
@@ -55,7 +69,7 @@ SealResult decode(const char* token, SealDecodeCallback callback);
 
 Async callbacks run from Seal's worker task. The `JsonDocument&` passed to verify and decode callbacks is valid only during the callback.
 
-Async submissions are accepted only while Seal is running. `deinit()` rejects work, signals the worker without depending on queue capacity, waits for worker completion, and securely discards queued jobs without invoking callbacks. Do not call `deinit()` from an async callback; it returns `SealCode::Busy`.
+Async submissions are accepted only while Seal is running. `deinit()` rejects new work, signals the worker without depending on queue capacity, waits for worker completion, securely discards queued jobs without invoking callbacks, and then releases the Strata-owned task/queue/semaphore resources. Do not call `deinit()` from an async callback; it returns `SealCode::Busy`.
 
 ## Base64url
 
@@ -63,4 +77,4 @@ Seal emits unpadded JWT base64url. Decode and verify accept trailing `=` padding
 
 ## Crypto Backend
 
-Seal v0.1 uses mbedTLS for production HMAC-SHA256. Backend-specific headers are isolated in `src/internal/SealCryptoMbedTls.cpp`; signing and verification code call only the internal `SealCrypto.h` facade. This is an internal extension point, not a public runtime plugin API.
+Seal v0.2 uses mbedTLS for production HMAC-SHA256. Backend-specific headers are isolated in `src/internal/SealCryptoMbedTls.cpp`; signing and verification code call only the internal `SealCrypto.h` facade. This is an internal extension point, not a public runtime plugin API.

@@ -46,8 +46,8 @@ void expectCode(const SealResult &result, SealCode code, const char *message) {
 SealConfig testConfig(size_t queueSize = 4) {
 	SealConfig config;
 	config.queueSize = queueSize;
-	config.stackType = SealStackType::Internal;
-	config.preferPsram = false;
+	config.memory.allocation = Strata::Placement::Internal;
+	config.memory.taskStack = Strata::Placement::Internal;
 	return config;
 }
 
