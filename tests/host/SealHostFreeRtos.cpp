@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <pthread.h>
 #include <thread>
 
 struct SealHostQueue {
@@ -129,6 +130,15 @@ QueueHandle_t xQueueCreate(UBaseType_t length, UBaseType_t itemSize) {
 	return queue;
 }
 
+QueueHandle_t xQueueCreateStatic(
+    UBaseType_t length,
+    UBaseType_t itemSize,
+    uint8_t *,
+    StaticQueue_t *
+) {
+	return xQueueCreate(length, itemSize);
+}
+
 void vQueueDelete(QueueHandle_t queue) {
 	if (queue == nullptr) {
 		return;
@@ -193,12 +203,32 @@ BaseType_t xQueueReceive(QueueHandle_t queue, void *outItem, TickType_t ticksToW
 	return pdTRUE;
 }
 
+BaseType_t xQueueSendFromISR(QueueHandle_t queue, const void *item, BaseType_t *) {
+	return xQueueSend(queue, item, 0);
+}
+
+BaseType_t xQueueReceiveFromISR(QueueHandle_t queue, void *outItem, BaseType_t *) {
+	return xQueueReceive(queue, outItem, 0);
+}
+
 SemaphoreHandle_t xSemaphoreCreateRecursiveMutex() {
 	return new (std::nothrow) SealHostSemaphore(SealHostSemaphore::Type::RecursiveMutex);
 }
 
 SemaphoreHandle_t xSemaphoreCreateBinary() {
 	return new (std::nothrow) SealHostSemaphore(SealHostSemaphore::Type::Binary);
+}
+
+SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *) {
+	return xSemaphoreCreateRecursiveMutex();
+}
+
+SemaphoreHandle_t xSemaphoreCreateRecursiveMutexStatic(StaticSemaphore_t *) {
+	return xSemaphoreCreateRecursiveMutex();
+}
+
+SemaphoreHandle_t xSemaphoreCreateBinaryStatic(StaticSemaphore_t *) {
+	return xSemaphoreCreateBinary();
 }
 
 void vSemaphoreDelete(SemaphoreHandle_t semaphore) {
@@ -224,11 +254,12 @@ BaseType_t xSemaphoreTakeRecursive(SemaphoreHandle_t semaphore, TickType_t) {
 	return pdTRUE;
 }
 
-void xSemaphoreGiveRecursive(SemaphoreHandle_t semaphore) {
+BaseType_t xSemaphoreGiveRecursive(SemaphoreHandle_t semaphore) {
 	if (semaphore == nullptr || semaphore->type != SealHostSemaphore::Type::RecursiveMutex) {
-		return;
+		return pdFALSE;
 	}
 	semaphore->recursiveMutex.unlock();
+	return pdTRUE;
 }
 
 BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore, TickType_t ticksToWait) {
@@ -295,6 +326,14 @@ BaseType_t xSemaphoreGive(SemaphoreHandle_t semaphore) {
 	return pdTRUE;
 }
 
+BaseType_t xSemaphoreTakeFromISR(SemaphoreHandle_t semaphore, BaseType_t *) {
+	return xSemaphoreTake(semaphore, 0);
+}
+
+BaseType_t xSemaphoreGiveFromISR(SemaphoreHandle_t semaphore, BaseType_t *) {
+	return xSemaphoreGive(semaphore);
+}
+
 BaseType_t xTaskCreate(
     TaskFunction_t entry,
     const char *,
@@ -333,6 +372,32 @@ BaseType_t xTaskCreatePinnedToCore(
 	return xTaskCreate(entry, name, stackDepth, arg, priority, handle);
 }
 
+TaskHandle_t xTaskCreateStatic(
+    TaskFunction_t entry,
+    const char *name,
+    configSTACK_DEPTH_TYPE stackDepth,
+    void *arg,
+    UBaseType_t priority,
+    StackType_t *,
+    StaticTask_t *
+) {
+	TaskHandle_t handle = nullptr;
+	return xTaskCreate(entry, name, stackDepth, arg, priority, &handle) == pdPASS ? handle : nullptr;
+}
+
+TaskHandle_t xTaskCreateStaticPinnedToCore(
+    TaskFunction_t entry,
+    const char *name,
+    configSTACK_DEPTH_TYPE stackDepth,
+    void *arg,
+    UBaseType_t priority,
+    StackType_t *stackStorage,
+    StaticTask_t *controlBlock,
+    BaseType_t
+) {
+	return xTaskCreateStatic(entry, name, stackDepth, arg, priority, stackStorage, controlBlock);
+}
+
 TaskHandle_t xTaskGetCurrentTaskHandle() {
 	if (gCurrentTask != nullptr) {
 		return gCurrentTask;
@@ -340,11 +405,38 @@ TaskHandle_t xTaskGetCurrentTaskHandle() {
 	return &gMainTask;
 }
 
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t) {
+	return 0;
+}
+
 void vTaskDelete(TaskHandle_t task) {
 	TaskHandle_t target = task == nullptr ? xTaskGetCurrentTaskHandle() : task;
 	if (target != nullptr) {
 		target->deleteRequested = true;
+		gControlCv.notify_all();
 	}
+}
+
+void vTaskSuspend(TaskHandle_t task) {
+	TaskHandle_t target = task == nullptr ? xTaskGetCurrentTaskHandle() : task;
+	if (target == nullptr || target == &gMainTask) {
+		return;
+	}
+	std::unique_lock<std::mutex> lock(gControlMutex);
+	gControlCv.wait(lock, [target] {
+		return target->deleteRequested.load();
+	});
+}
+
+void vTaskDelay(TickType_t ticks) {
+	if (gCurrentTask != nullptr && gCurrentTask != &gMainTask && gCurrentTask->deleteRequested.load()) {
+		pthread_exit(nullptr);
+	}
+	if (ticks == portMAX_DELAY) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		return;
+	}
+	std::this_thread::sleep_for(ticksToDuration(ticks));
 }
 
 } // extern "C"
