@@ -10,11 +10,17 @@ The token was changed, the wrong secret was used, or the signature segment is ma
 
 ## `AlgorithmMismatch`
 
-Seal v0.1 supports only HS256. Tokens with `alg` values such as `none`, `RS256`, or `ES256` are rejected.
+Seal v0.2 supports only HS256. Tokens with `alg` values such as `none`, `RS256`, or `ES256` are rejected.
 
 ## `BufferTooSmall`
 
 The payload, header, token, or caller-provided output buffer is smaller than required. Increase `SealConfig` limits or provide a larger output buffer.
+
+## `AllocationFailed` with `RequireExternal`
+
+`Strata::Placement::RequireExternal` intentionally does not fall back to internal memory. If PSRAM/external RAM is unavailable or exhausted, token/job/queue allocation can fail through `memory.allocation`, and async initialization can fail through `memory.taskStack`.
+
+Use `Strata::Placement::PreferExternal` when external RAM is preferred but internal fallback is acceptable, or `Strata::Placement::Internal` when the resource must remain internal.
 
 ## Async Callback Did Not Run
 

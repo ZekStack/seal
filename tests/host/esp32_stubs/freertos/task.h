@@ -25,8 +25,32 @@ BaseType_t xTaskCreatePinnedToCore(
     BaseType_t coreId
 );
 
+TaskHandle_t xTaskCreateStatic(
+    TaskFunction_t entry,
+    const char *name,
+    configSTACK_DEPTH_TYPE stackDepth,
+    void *arg,
+    UBaseType_t priority,
+    StackType_t *stackStorage,
+    StaticTask_t *controlBlock
+);
+
+TaskHandle_t xTaskCreateStaticPinnedToCore(
+    TaskFunction_t entry,
+    const char *name,
+    configSTACK_DEPTH_TYPE stackDepth,
+    void *arg,
+    UBaseType_t priority,
+    StackType_t *stackStorage,
+    StaticTask_t *controlBlock,
+    BaseType_t coreId
+);
+
 TaskHandle_t xTaskGetCurrentTaskHandle();
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task);
 void vTaskDelete(TaskHandle_t task);
+void vTaskSuspend(TaskHandle_t task);
+void vTaskDelay(TickType_t ticks);
 
 #ifdef __cplusplus
 }

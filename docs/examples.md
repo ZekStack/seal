@@ -18,8 +18,19 @@ Shows how to pass epoch timestamps from an external clock source. Seal does not 
 
 ## `async-sign-verify`
 
-Queues signing and verification work on Seal's worker task.
+Queues signing and verification work on Seal's Strata-backed worker task.
 
 ## `caller-buffer`
 
-Signs into a fixed caller-owned character buffer.
+Signs into a fixed caller-owned character buffer. Caller-owned storage is not affected by `SealConfig::memory`.
+
+## `memory-policy`
+
+Shows the shared ZekStack memory policy. The example prefers external RAM for Seal-owned buffers while forcing the async worker stack into internal RAM.
+
+```cpp
+SealConfig config;
+config.memory.allocation = Strata::Placement::PreferExternal;
+config.memory.taskStack = Strata::Placement::Internal;
+seal.init(config);
+```

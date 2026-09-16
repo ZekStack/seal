@@ -1,6 +1,6 @@
 {
   "name": "Seal",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "JWT signing, verification, and decode library for ESP32.",
   "keywords": [
     "esp32",
@@ -23,7 +23,8 @@
   "frameworks": "arduino",
   "platforms": "espressif32",
   "dependencies": {
-    "bblanchon/ArduinoJson": ">=7.0.0"
+    "bblanchon/ArduinoJson": ">=7.0.0",
+    "Strata": "https://github.com/ZekStack/strata.git#v0.1.2"
   },
   "build": {
     "srcDir": "src",

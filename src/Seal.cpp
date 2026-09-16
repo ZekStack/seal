@@ -2,24 +2,21 @@
 
 #include "internal/SealBase64Url.h"
 #include "internal/SealCrypto.h"
-#include "internal/SealMemory.h"
 #include "internal/SealMutex.h"
-#include "internal/SealTaskSupport.h"
 
-#include <algorithm>
-#include <cstring>
-#include <limits>
-#include <memory>
-#include <new>
-#include <string>
-#include <utility>
-#include <vector>
+#include <strata/arduinojson/Allocator.h>
 
 #if defined(ESP32)
-#include <freertos/queue.h>
-#include <freertos/semphr.h>
+#include <strata/freertos/BinarySemaphore.h>
+#include <strata/freertos/Queue.h>
+#include <strata/freertos/Task.h>
+
 #include <freertos/task.h>
 #endif
+
+#include <cstring>
+#include <limits>
+#include <utility>
 
 namespace {
 
@@ -44,6 +41,9 @@ size_t cstringLength(const char *value) {
 }
 
 SealResult validateConfig(const SealConfig &config) {
+	if (!Strata::validMemoryPolicy(config.memory)) {
+		return SealResult::failure(SealCode::InvalidArgument, "invalid memory policy");
+	}
 	if (config.maxTokenSize < 64 || config.maxPayloadSize == 0 || config.maxHeaderSize == 0 ||
 	    config.maxSignatureSize < 43) {
 		return SealResult::failure(SealCode::InvalidArgument, "invalid seal size limits");
@@ -54,7 +54,12 @@ SealResult validateConfig(const SealConfig &config) {
 	return SealResult::success();
 }
 
-SealResult serializeDocument(const JsonDocument &doc, size_t maxBytes, std::string &out) {
+SealResult serializeDocument(
+    const JsonDocument &doc,
+    size_t maxBytes,
+    Strata::Placement placement,
+    Strata::String &out
+) {
 	const size_t measured = measureJson(doc);
 	if (measured == 0) {
 		return SealResult::failure(SealCode::InvalidPayload, "json payload is empty");
@@ -63,7 +68,8 @@ SealResult serializeDocument(const JsonDocument &doc, size_t maxBytes, std::stri
 		return SealResult::failure(SealCode::BufferTooSmall, "json exceeds configured size limit");
 	}
 
-	std::vector<char> buffer(measured + 1);
+	auto buffer = Strata::makeVector<char>(placement);
+	buffer.resize(measured + 1);
 	const size_t written = serializeJson(doc, buffer.data(), buffer.size());
 	if (written == 0 || written > maxBytes) {
 		return SealResult::failure(SealCode::JsonError, "json serialization failed");
@@ -73,9 +79,14 @@ SealResult serializeDocument(const JsonDocument &doc, size_t maxBytes, std::stri
 	return SealResult::success();
 }
 
-SealResult encodeString(const std::string &input, std::string &out) {
+SealResult encodeString(
+    const Strata::String &input,
+    Strata::Placement placement,
+    Strata::String &out
+) {
 	const size_t capacity = seal::internal::base64UrlEncodedLength(input.size()) + 1;
-	std::vector<char> buffer(capacity);
+	auto buffer = Strata::makeVector<char>(placement);
+	buffer.resize(capacity);
 	size_t written = 0;
 	SealResult result = seal::internal::base64UrlEncode(
 	    reinterpret_cast<const uint8_t *>(input.data()),
@@ -91,13 +102,19 @@ SealResult encodeString(const std::string &input, std::string &out) {
 	return SealResult::success();
 }
 
-SealResult decodeStringSegment(const char *segment, size_t length, std::string &out) {
+SealResult decodeStringSegment(
+    const char *segment,
+    size_t length,
+    Strata::Placement placement,
+    Strata::String &out
+) {
 	if (segment == nullptr || length == 0) {
 		return SealResult::failure(SealCode::MalformedToken, "empty jwt segment");
 	}
 
 	const size_t capacity = seal::internal::base64UrlDecodedMaxLength(length) + 1;
-	std::vector<uint8_t> buffer(capacity);
+	auto buffer = Strata::makeVector<uint8_t>(placement);
+	buffer.resize(capacity);
 	size_t written = 0;
 	SealResult result = seal::internal::base64UrlDecode(
 	    segment,
@@ -209,19 +226,36 @@ bool maxAgeExceeded(uint64_t now, uint64_t issuedAt, uint64_t maxAgeSeconds, uin
 	return age - maxAgeSeconds >= static_cast<uint64_t>(toleranceSeconds);
 }
 
+#if defined(ESP32)
+[[noreturn]] void suspendForever() {
+	vTaskSuspend(nullptr);
+	for (;;) {
+		vTaskDelay(portMAX_DELAY);
+	}
+}
+#endif
+
 } // namespace
 
 struct SealJob {
+	explicit SealJob(Strata::Placement placement) noexcept
+	    : payloadJson(Strata::Allocator<char>{placement}),
+	      token(Strata::Allocator<char>{placement}),
+	      secret(Strata::Allocator<char>{placement}) {
+	}
+
 	SealJobType type = SealJobType::Decode;
-	std::string payloadJson;
-	std::string token;
-	std::string secret;
+	Strata::String payloadJson;
+	Strata::String token;
+	Strata::String secret;
 	SealOptions signOptions;
 	SealVerifyOptions verifyOptions;
 	SealSignCallback signCallback;
 	SealVerifyCallback verifyCallback;
 	SealDecodeCallback decodeCallback;
 };
+
+using SealJobPtr = Strata::UniquePtr<SealJob>;
 
 struct SealImpl {
 	SealConfig config{};
@@ -233,15 +267,18 @@ struct SealImpl {
 	bool stopRequested = false;
 	uint16_t callbackDepth = 0;
 #if defined(ESP32)
-	QueueHandle_t queue = nullptr;
-	TaskHandle_t task = nullptr;
-	SemaphoreHandle_t doneSignal = nullptr;
-	bool taskCreatedWithCaps = false;
+	Strata::FreeRTOS::Queue<SealJob *> queue;
+	Strata::FreeRTOS::Task task;
+	Strata::FreeRTOS::BinarySemaphore doneSignal;
 	bool shutdownWaitInProgress = false;
 #endif
 
-	bool shouldPreferPsram() const {
-		return config.preferPsram;
+	Strata::Placement allocationPlacement() const noexcept {
+		return config.memory.allocation;
+	}
+
+	SealJobPtr makeJob() {
+		return Strata::makeUnique<SealJob>(allocationPlacement(), allocationPlacement());
 	}
 
 	SealResult readClock(const SealVerifyOptions *options, uint64_t &out) {
@@ -259,21 +296,21 @@ struct SealImpl {
 		return SealResult::failure(SealCode::ClockUnavailable, "clock is unavailable");
 	}
 
-	SealResult allocateToken(const std::string &token, SealToken &outToken) {
-		if (token.size() > config.maxTokenSize) {
+	SealResult allocateToken(const Strata::String &tokenValue, SealToken &outToken) {
+		if (tokenValue.size() > config.maxTokenSize) {
 			return SealResult::failure(SealCode::BufferTooSmall, "token exceeds configured size limit");
 		}
 
-		char *value = static_cast<char *>(seal::internal::allocate(token.size() + 1, shouldPreferPsram()));
+		char *value = static_cast<char *>(Strata::allocate(tokenValue.size() + 1, allocationPlacement()));
 		if (value == nullptr) {
 			return SealResult::failure(SealCode::AllocationFailed, "token allocation failed");
 		}
 
-		std::memcpy(value, token.c_str(), token.size() + 1);
+		std::memcpy(value, tokenValue.c_str(), tokenValue.size() + 1);
 		outToken.clear();
 		outToken.value = value;
-		outToken.length = token.size();
-		outToken.capacity = token.size() + 1;
+		outToken.length = tokenValue.size();
+		outToken.capacity = tokenValue.size() + 1;
 		return SealResult::success();
 	}
 
@@ -281,7 +318,7 @@ struct SealImpl {
 	    const JsonDocument &payload,
 	    const SealOptions &options,
 	    const char *secret,
-		std::string &outToken
+	    Strata::String &outToken
 	) {
 		outToken.clear();
 		if (lifecycle != SealLifecycle::Running) {
@@ -297,15 +334,24 @@ struct SealImpl {
 			return SealResult::failure(SealCode::InvalidPayload, "jwt payload must be a json object");
 		}
 
-		JsonDocument header;
+		Strata::ArduinoJson::Allocator jsonAllocator{allocationPlacement()};
+		JsonDocument header{&jsonAllocator};
 		header["alg"] = "HS256";
 		header["typ"] = "JWT";
 		if (!isEmpty(options.keyid)) {
 			header["kid"] = options.keyid;
 		}
+		if (header.overflowed()) {
+			return SealResult::failure(SealCode::AllocationFailed, "jwt header allocation failed");
+		}
 
-		std::string headerJson;
-		SealResult result = serializeDocument(header, config.maxHeaderSize, headerJson);
+		auto headerJson = Strata::makeString(allocationPlacement());
+		SealResult result = serializeDocument(
+		    header,
+		    config.maxHeaderSize,
+		    allocationPlacement(),
+		    headerJson
+		);
 		if (!result) {
 			if (result.code == SealCode::BufferTooSmall) {
 				return result;
@@ -313,8 +359,11 @@ struct SealImpl {
 			return SealResult::failure(SealCode::InvalidHeader, result.message);
 		}
 
-		JsonDocument workingPayload;
+		JsonDocument workingPayload{&jsonAllocator};
 		workingPayload.set(payload.as<JsonObjectConst>());
+		if (workingPayload.overflowed()) {
+			return SealResult::failure(SealCode::AllocationFailed, "jwt payload allocation failed");
+		}
 		JsonObject object = workingPayload.as<JsonObject>();
 		if (options.iat > 0) {
 			object["iat"] = options.iat;
@@ -342,9 +391,17 @@ struct SealImpl {
 		if (!isEmpty(options.jwtid)) {
 			object["jti"] = options.jwtid;
 		}
+		if (workingPayload.overflowed()) {
+			return SealResult::failure(SealCode::AllocationFailed, "jwt payload allocation failed");
+		}
 
-		std::string payloadJson;
-		result = serializeDocument(workingPayload, config.maxPayloadSize, payloadJson);
+		auto payloadJson = Strata::makeString(allocationPlacement());
+		result = serializeDocument(
+		    workingPayload,
+		    config.maxPayloadSize,
+		    allocationPlacement(),
+		    payloadJson
+		);
 		if (!result) {
 			if (result.code == SealCode::BufferTooSmall) {
 				return result;
@@ -352,18 +409,23 @@ struct SealImpl {
 			return SealResult::failure(SealCode::InvalidPayload, result.message);
 		}
 
-		std::string encodedHeader;
-		std::string encodedPayload;
-		result = encodeString(headerJson, encodedHeader);
+		auto encodedHeader = Strata::makeString(allocationPlacement());
+		auto encodedPayload = Strata::makeString(allocationPlacement());
+		result = encodeString(headerJson, allocationPlacement(), encodedHeader);
 		if (!result) {
 			return result;
 		}
-		result = encodeString(payloadJson, encodedPayload);
+		result = encodeString(payloadJson, allocationPlacement(), encodedPayload);
 		if (!result) {
 			return result;
 		}
 
-		std::string signingInput = encodedHeader + "." + encodedPayload;
+		auto signingInput = Strata::makeString(allocationPlacement());
+		signingInput.reserve(encodedHeader.size() + encodedPayload.size() + 1);
+		signingInput.append(encodedHeader);
+		signingInput.push_back('.');
+		signingInput.append(encodedPayload);
+
 		uint8_t signature[seal::internal::kHs256SignatureBytes] = {0};
 		result = seal::internal::hmacSha256(
 		    reinterpret_cast<const uint8_t *>(secret),
@@ -379,7 +441,8 @@ struct SealImpl {
 
 		const size_t encodedSignatureCapacity =
 		    seal::internal::base64UrlEncodedLength(sizeof(signature)) + 1;
-		std::vector<char> encodedSignature(encodedSignatureCapacity);
+		auto encodedSignature = Strata::makeVector<char>(allocationPlacement());
+		encodedSignature.resize(encodedSignatureCapacity);
 		size_t signatureWritten = 0;
 		result = seal::internal::base64UrlEncode(
 		    signature,
@@ -393,7 +456,10 @@ struct SealImpl {
 			return result;
 		}
 
-		outToken = signingInput + "." + std::string(encodedSignature.data(), signatureWritten);
+		outToken.reserve(signingInput.size() + signatureWritten + 1);
+		outToken.assign(signingInput);
+		outToken.push_back('.');
+		outToken.append(encodedSignature.data(), signatureWritten);
 		if (outToken.size() > config.maxTokenSize) {
 			outToken.clear();
 			return SealResult::failure(SealCode::BufferTooSmall, "token exceeds configured size limit");
@@ -402,19 +468,24 @@ struct SealImpl {
 	}
 
 	SealResult decodeParts(
-	    const char *token,
+	    const char *tokenValue,
 	    JsonDocument *outHeader,
 	    JsonDocument *outPayload,
 	    TokenSegments *outSegments = nullptr
 	) {
 		TokenSegments segments;
-		SealResult result = splitToken(token, config.maxTokenSize, segments);
+		SealResult result = splitToken(tokenValue, config.maxTokenSize, segments);
 		if (!result) {
 			return result;
 		}
 
-		std::string headerJson;
-		result = decodeStringSegment(segments.header, segments.headerLength, headerJson);
+		auto headerJson = Strata::makeString(allocationPlacement());
+		result = decodeStringSegment(
+		    segments.header,
+		    segments.headerLength,
+		    allocationPlacement(),
+		    headerJson
+		);
 		if (!result) {
 			return SealResult::failure(SealCode::InvalidHeader, result.message);
 		}
@@ -422,8 +493,13 @@ struct SealImpl {
 			return SealResult::failure(SealCode::BufferTooSmall, "header exceeds configured size limit");
 		}
 
-		std::string payloadJson;
-		result = decodeStringSegment(segments.payload, segments.payloadLength, payloadJson);
+		auto payloadJson = Strata::makeString(allocationPlacement());
+		result = decodeStringSegment(
+		    segments.payload,
+		    segments.payloadLength,
+		    allocationPlacement(),
+		    payloadJson
+		);
 		if (!result) {
 			return SealResult::failure(SealCode::InvalidPayload, result.message);
 		}
@@ -431,19 +507,28 @@ struct SealImpl {
 			return SealResult::failure(SealCode::BufferTooSmall, "payload exceeds configured size limit");
 		}
 
-		JsonDocument header;
-		DeserializationError headerError = deserializeJson(header, headerJson);
+		Strata::ArduinoJson::Allocator jsonAllocator{allocationPlacement()};
+		JsonDocument header{&jsonAllocator};
+		DeserializationError headerError =
+		    deserializeJson(header, headerJson.c_str(), headerJson.size());
 		if (headerError) {
 			return SealResult::failure(SealCode::InvalidHeader, "invalid jwt header json");
+		}
+		if (header.overflowed()) {
+			return SealResult::failure(SealCode::AllocationFailed, "jwt header allocation failed");
 		}
 		if (!header.is<JsonObject>()) {
 			return SealResult::failure(SealCode::InvalidHeader, "jwt header must be an object");
 		}
 
-		JsonDocument payload;
-		DeserializationError payloadError = deserializeJson(payload, payloadJson);
+		JsonDocument payload{&jsonAllocator};
+		DeserializationError payloadError =
+		    deserializeJson(payload, payloadJson.c_str(), payloadJson.size());
 		if (payloadError) {
 			return SealResult::failure(SealCode::InvalidPayload, "invalid jwt payload json");
+		}
+		if (payload.overflowed()) {
+			return SealResult::failure(SealCode::AllocationFailed, "jwt payload allocation failed");
 		}
 		if (!payload.is<JsonObject>()) {
 			return SealResult::failure(SealCode::InvalidPayload, "jwt payload must be an object");
@@ -464,22 +549,23 @@ struct SealImpl {
 	}
 
 	SealResult verifyToken(
-	    const char *token,
-	    const char *secret,
+	    const char *tokenValue,
+	    const char *secretValue,
 	    const SealVerifyOptions &options,
 	    JsonDocument &outPayload
 	) {
 		if (lifecycle != SealLifecycle::Running) {
 			return resultForLifecycle(lifecycle);
 		}
-		if (isEmpty(secret)) {
+		if (isEmpty(secretValue)) {
 			return SealResult::failure(SealCode::InvalidArgument, "secret is required");
 		}
 
-		JsonDocument header;
-		JsonDocument payload;
+		Strata::ArduinoJson::Allocator jsonAllocator{allocationPlacement()};
+		JsonDocument header{&jsonAllocator};
+		JsonDocument payload{&jsonAllocator};
 		TokenSegments segments;
-		SealResult result = decodeParts(token, &header, &payload, &segments);
+		SealResult result = decodeParts(tokenValue, &header, &payload, &segments);
 		if (!result) {
 			return result;
 		}
@@ -512,13 +598,13 @@ struct SealImpl {
 			return SealResult::failure(SealCode::InvalidSignature, "invalid jwt signature");
 		}
 
-		const size_t signingInputLength =
-		    segments.headerLength + 1 + segments.payloadLength;
-		std::string signingInput(token, signingInputLength);
+		const size_t signingInputLength = segments.headerLength + 1 + segments.payloadLength;
+		auto signingInput = Strata::makeString(allocationPlacement());
+		signingInput.assign(tokenValue, signingInputLength);
 		uint8_t expectedSignature[seal::internal::kHs256SignatureBytes] = {0};
 		result = seal::internal::hmacSha256(
-		    reinterpret_cast<const uint8_t *>(secret),
-		    cstringLength(secret),
+		    reinterpret_cast<const uint8_t *>(secretValue),
+		    cstringLength(secretValue),
 		    reinterpret_cast<const uint8_t *>(signingInput.data()),
 		    signingInput.size(),
 		    expectedSignature
@@ -613,30 +699,28 @@ struct SealImpl {
 		return SealResult::success();
 	}
 
-	SealResult submitJob(SealJob *job) {
-		if (job == nullptr) {
+	SealResult submitJob(SealJobPtr job) {
+		if (!job) {
 			return SealResult::failure(SealCode::AllocationFailed, "job allocation failed");
 		}
 		if (lifecycle != SealLifecycle::Running) {
-			secureJob(job);
-			delete job;
+			secureJob(job.get());
 			return resultForLifecycle(lifecycle);
 		}
 #if defined(ESP32)
-		if (!config.enableAsync || queue == nullptr) {
-			secureJob(job);
-			delete job;
+		if (!config.enableAsync || !queue.valid()) {
+			secureJob(job.get());
 			return SealResult::failure(SealCode::InvalidArgument, "async is disabled");
 		}
-		if (xQueueSend(queue, &job, 0) != pdTRUE) {
-			secureJob(job);
-			delete job;
+		SealJob *raw = job.get();
+		if (!queue.send(raw, 0)) {
+			secureJob(job.get());
 			return SealResult::failure(SealCode::QueueFull, "seal async queue is full");
 		}
+		(void)job.release();
 		return SealResult::success();
 #else
-		secureJob(job);
-		delete job;
+		secureJob(job.get());
 		return SealResult::failure(SealCode::InvalidArgument, "async requires ESP32");
 #endif
 	}
@@ -666,7 +750,8 @@ struct SealImpl {
 		if (!lock) {
 			return false;
 		}
-		return callbackDepth > 0 || (task != nullptr && xTaskGetCurrentTaskHandle() == task);
+		return callbackDepth > 0 ||
+		       (task.valid() && xTaskGetCurrentTaskHandle() == task.handle());
 	}
 
 	void requestStopWithoutJoin() {
@@ -705,15 +790,17 @@ struct SealImpl {
 			if (shouldStopWorker()) {
 				break;
 			}
-			SealJob *job = nullptr;
-			if (xQueueReceive(queue, &job, pdMS_TO_TICKS(50)) != pdTRUE || job == nullptr) {
+			SealJob *raw = nullptr;
+			if (!queue.receive(raw, pdMS_TO_TICKS(50)) || raw == nullptr) {
 				continue;
 			}
+			SealJobPtr job{raw};
 
 			if (job->type == SealJobType::Sign) {
-				JsonDocument payload;
+				Strata::ArduinoJson::Allocator jsonAllocator{allocationPlacement()};
+				JsonDocument payload{&jsonAllocator};
 				SealResult result = SealResult::success();
-				if (deserializeJson(payload, job->payloadJson)) {
+				if (deserializeJson(payload, job->payloadJson.c_str(), job->payloadJson.size())) {
 					result = SealResult::failure(SealCode::InvalidPayload, "invalid queued payload json");
 				}
 				SealToken token;
@@ -722,8 +809,13 @@ struct SealImpl {
 					if (!lock) {
 						result = SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 					} else {
-						std::string tokenValue;
-						result = buildSignedToken(payload, job->signOptions, job->secret.c_str(), tokenValue);
+						auto tokenValue = Strata::makeString(allocationPlacement());
+						result = buildSignedToken(
+						    payload,
+						    job->signOptions,
+						    job->secret.c_str(),
+						    tokenValue
+						);
 						if (result) {
 							result = allocateToken(tokenValue, token);
 						}
@@ -735,15 +827,20 @@ struct SealImpl {
 				}
 				endCallback();
 			} else if (job->type == SealJobType::Verify) {
-				JsonDocument payload;
+				Strata::ArduinoJson::Allocator jsonAllocator{allocationPlacement()};
+				JsonDocument payload{&jsonAllocator};
 				SealResult result = SealResult::success();
 				{
 					SealLock lock(mutex, config.useMutex);
 					if (!lock) {
 						result = SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 					} else {
-						result =
-						    verifyToken(job->token.c_str(), job->secret.c_str(), job->verifyOptions, payload);
+						result = verifyToken(
+						    job->token.c_str(),
+						    job->secret.c_str(),
+						    job->verifyOptions,
+						    payload
+						);
 					}
 				}
 				beginCallback();
@@ -752,7 +849,8 @@ struct SealImpl {
 				}
 				endCallback();
 			} else if (job->type == SealJobType::Decode) {
-				JsonDocument payload;
+				Strata::ArduinoJson::Allocator jsonAllocator{allocationPlacement()};
+				JsonDocument payload{&jsonAllocator};
 				SealResult result = SealResult::success();
 				{
 					SealLock lock(mutex, config.useMutex);
@@ -771,13 +869,10 @@ struct SealImpl {
 				endCallback();
 			}
 
-			secureJob(job);
-			delete job;
+			secureJob(job.get());
 		}
-		if (doneSignal != nullptr) {
-			xSemaphoreGive(doneSignal);
-		}
-		seal::internal::task::deleteCurrentTask(taskCreatedWithCaps);
+		(void)doneSignal.give();
+		suspendForever();
 	}
 #endif
 };
@@ -820,14 +915,14 @@ bool SealToken::empty() const {
 void SealToken::clear() {
 	if (value != nullptr) {
 		seal::internal::secureClear(value, capacity);
-		seal::internal::release(value);
+		Strata::free(value);
 	}
 	value = nullptr;
 	length = 0;
 	capacity = 0;
 }
 
-Seal::Seal() : _impl(new (std::nothrow) SealImpl()) {
+Seal::Seal() : _impl(Strata::makeUnique<SealImpl>(Strata::Placement::Internal)) {
 }
 
 Seal::~Seal() {
@@ -837,17 +932,17 @@ Seal::~Seal() {
 	}
 	if (_impl->destructionWouldDeadlock()) {
 		_impl->requestStopWithoutJoin();
-		_impl.release();
+		(void)_impl.release();
 		return;
 	}
 	SealResult result = deinitInternal(portMAX_DELAY, true);
 	if (!result && result.code == SealCode::Busy) {
 		_impl->requestStopWithoutJoin();
-		_impl.release();
+		(void)_impl.release();
 		return;
 	}
 #else
-	deinit();
+	(void)deinit();
 #endif
 }
 
@@ -869,6 +964,7 @@ SealResult Seal::init(const SealConfig &config) {
 	if (!result) {
 		return result;
 	}
+
 	_impl->config = config;
 	_impl->fixedClockTimestamp = 0;
 	_impl->useFixedClockTimestamp = false;
@@ -879,50 +975,40 @@ SealResult Seal::init(const SealConfig &config) {
 #if defined(ESP32)
 	_impl->shutdownWaitInProgress = false;
 	if (config.enableAsync) {
-		_impl->queue = xQueueCreate(config.queueSize, sizeof(SealJob *));
-		if (_impl->queue == nullptr) {
+		_impl->queue = Strata::FreeRTOS::Queue<SealJob *>::create({
+		    .length = config.queueSize,
+		    .storagePlacement = config.memory.allocation,
+		    .usage = Strata::FreeRTOS::QueueUsage::TaskOnly,
+		});
+		if (!_impl->queue) {
 			_impl->lifecycle = SealLifecycle::Stopped;
 			return SealResult::failure(SealCode::AllocationFailed, "seal queue allocation failed");
 		}
-		_impl->doneSignal = xSemaphoreCreateBinary();
-		if (_impl->doneSignal == nullptr) {
-			vQueueDelete(_impl->queue);
-			_impl->queue = nullptr;
+
+		_impl->doneSignal = Strata::FreeRTOS::BinarySemaphore::create();
+		if (!_impl->doneSignal) {
+			_impl->queue.reset();
 			_impl->lifecycle = SealLifecycle::Stopped;
-			return SealResult::failure(SealCode::AllocationFailed, "seal shutdown signal allocation failed");
-		}
-		bool usePsramStack =
-		    config.stackType == SealStackType::Psram ||
-		    (config.stackType == SealStackType::Auto && config.preferPsram);
-		BaseType_t created = seal::internal::task::createTask(
-		    SealImpl::taskEntry,
-		    "Seal",
-		    config.stackSizeBytes,
-		    _impl.get(),
-		    config.priority,
-		    &_impl->task,
-		    config.coreId,
-		    usePsramStack,
-		    _impl->taskCreatedWithCaps
-		);
-		if (created != pdPASS && config.stackType == SealStackType::Auto) {
-			created = seal::internal::task::createTask(
-			    SealImpl::taskEntry,
-			    "Seal",
-			    config.stackSizeBytes,
-			    _impl.get(),
-			    config.priority,
-			    &_impl->task,
-			    config.coreId,
-			    false,
-			    _impl->taskCreatedWithCaps
+			return SealResult::failure(
+			    SealCode::AllocationFailed,
+			    "seal shutdown signal allocation failed"
 			);
 		}
-		if (created != pdPASS) {
-			vQueueDelete(_impl->queue);
-			_impl->queue = nullptr;
-			vSemaphoreDelete(_impl->doneSignal);
-			_impl->doneSignal = nullptr;
+
+		_impl->task = Strata::FreeRTOS::Task::create(
+		    SealImpl::taskEntry,
+		    _impl.get(),
+		    Strata::FreeRTOS::TaskConfig{
+		        .name = "Seal",
+		        .stackBytes = config.stackSizeBytes,
+		        .stackPlacement = config.memory.taskStack,
+		        .priority = config.priority,
+		        .affinity = config.coreId,
+		    }
+		);
+		if (!_impl->task) {
+			_impl->doneSignal.reset();
+			_impl->queue.reset();
 			_impl->lifecycle = SealLifecycle::Stopped;
 			return SealResult::failure(SealCode::AllocationFailed, "seal task creation failed");
 		}
@@ -951,13 +1037,6 @@ SealResult Seal::deinit() {
 			return SealResult::failure(SealCode::Busy, "cannot deinit seal from callback");
 		}
 		_impl->lifecycle = SealLifecycle::Stopped;
-	}
-
-	{
-		SealLock lock(_impl->mutex, _impl->config.useMutex);
-		if (!lock) {
-			return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
-		}
 		_impl->timeProvider = nullptr;
 		_impl->useFixedClockTimestamp = false;
 	}
@@ -972,11 +1051,7 @@ SealResult Seal::deinitInternal(TickType_t waitTicks, bool fromDestructor) {
 		return SealResult::success();
 	}
 
-	QueueHandle_t queueToDelete = nullptr;
-	SemaphoreHandle_t doneSignalToDelete = nullptr;
 	bool waitForWorker = false;
-	SemaphoreHandle_t doneSignalToWait = nullptr;
-
 	{
 		SealLock lock(impl->mutex, impl->config.useMutex);
 		if (!lock) {
@@ -988,26 +1063,20 @@ SealResult Seal::deinitInternal(TickType_t waitTicks, bool fromDestructor) {
 		if (impl->callbackDepth > 0) {
 			return SealResult::failure(SealCode::Busy, "cannot deinit seal from callback");
 		}
-		if (impl->task != nullptr && xTaskGetCurrentTaskHandle() == impl->task) {
+		if (impl->task.valid() && xTaskGetCurrentTaskHandle() == impl->task.handle()) {
 			return SealResult::failure(SealCode::Busy, "cannot deinit seal from worker task");
 		}
-
 		if (impl->lifecycle == SealLifecycle::Stopping && impl->shutdownWaitInProgress) {
 			return SealResult::failure(SealCode::Busy, "seal shutdown already in progress");
 		}
 
-		if (impl->lifecycle == SealLifecycle::Running && impl->queue != nullptr &&
-		    impl->task != nullptr) {
+		if ((impl->lifecycle == SealLifecycle::Running ||
+		     impl->lifecycle == SealLifecycle::Stopping) &&
+		    impl->queue.valid() && impl->task.valid()) {
 			impl->lifecycle = SealLifecycle::Stopping;
 			impl->stopRequested = true;
 			impl->shutdownWaitInProgress = true;
 			waitForWorker = true;
-			doneSignalToWait = impl->doneSignal;
-		} else if (impl->lifecycle == SealLifecycle::Stopping && impl->queue != nullptr &&
-		           impl->task != nullptr) {
-			impl->shutdownWaitInProgress = true;
-			waitForWorker = true;
-			doneSignalToWait = impl->doneSignal;
 		} else {
 			impl->lifecycle = SealLifecycle::Stopped;
 			impl->stopRequested = false;
@@ -1018,7 +1087,7 @@ SealResult Seal::deinitInternal(TickType_t waitTicks, bool fromDestructor) {
 	}
 
 	if (waitForWorker) {
-		if (doneSignalToWait == nullptr || xSemaphoreTake(doneSignalToWait, waitTicks) != pdTRUE) {
+		if (!impl->doneSignal.valid() || !impl->doneSignal.take(waitTicks)) {
 			SealLock lock(impl->mutex, impl->config.useMutex);
 			if (!lock) {
 				return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
@@ -1028,33 +1097,26 @@ SealResult Seal::deinitInternal(TickType_t waitTicks, bool fromDestructor) {
 			return SealResult::failure(SealCode::Busy, "seal worker did not stop");
 		}
 
+		SealJob *queued = nullptr;
+		while (impl->queue.receive(queued, 0)) {
+			SealJobPtr job{queued};
+			impl->secureJob(job.get());
+			queued = nullptr;
+		}
+
+		impl->task.reset();
+		impl->queue.reset();
+		impl->doneSignal.reset();
+
 		SealLock lock(impl->mutex, impl->config.useMutex);
 		if (!lock) {
 			return SealResult::failure(SealCode::InternalError, "seal mutex lock failed");
 		}
-		SealJob *queued = nullptr;
-		while (xQueueReceive(impl->queue, &queued, 0) == pdTRUE) {
-			impl->secureJob(queued);
-			delete queued;
-		}
-		queueToDelete = impl->queue;
-		doneSignalToDelete = impl->doneSignal;
-		impl->queue = nullptr;
-		impl->doneSignal = nullptr;
-		impl->task = nullptr;
-		impl->taskCreatedWithCaps = false;
 		impl->shutdownWaitInProgress = false;
 		impl->stopRequested = false;
 		impl->lifecycle = SealLifecycle::Stopped;
 		impl->timeProvider = nullptr;
 		impl->useFixedClockTimestamp = false;
-	}
-
-	if (queueToDelete != nullptr) {
-		vQueueDelete(queueToDelete);
-	}
-	if (doneSignalToDelete != nullptr) {
-		vSemaphoreDelete(doneSignalToDelete);
 	}
 
 	(void)fromDestructor;
@@ -1137,12 +1199,12 @@ SealResult Seal::sign(
 	if (_impl->lifecycle != SealLifecycle::Running) {
 		return resultForLifecycle(_impl->lifecycle);
 	}
-	std::string token;
-	SealResult result = _impl->buildSignedToken(payload, options, secret, token);
+	auto tokenValue = Strata::makeString(_impl->allocationPlacement());
+	SealResult result = _impl->buildSignedToken(payload, options, secret, tokenValue);
 	if (!result) {
 		return result;
 	}
-	return _impl->allocateToken(token, outToken);
+	return _impl->allocateToken(tokenValue, outToken);
 }
 
 SealResult Seal::sign(
@@ -1167,16 +1229,16 @@ SealResult Seal::sign(
 	if (_impl->lifecycle != SealLifecycle::Running) {
 		return resultForLifecycle(_impl->lifecycle);
 	}
-	std::string token;
-	SealResult result = _impl->buildSignedToken(payload, options, secret, token);
+	auto tokenValue = Strata::makeString(_impl->allocationPlacement());
+	SealResult result = _impl->buildSignedToken(payload, options, secret, tokenValue);
 	if (!result) {
 		return result;
 	}
-	if (outTokenSize <= token.size()) {
+	if (outTokenSize <= tokenValue.size()) {
 		return SealResult::failure(SealCode::BufferTooSmall, "output token buffer too small");
 	}
-	std::memcpy(outToken, token.c_str(), token.size() + 1);
-	written = token.size();
+	std::memcpy(outToken, tokenValue.c_str(), tokenValue.size() + 1);
+	written = tokenValue.size();
 	return SealResult::success();
 }
 
@@ -1279,13 +1341,19 @@ SealResult Seal::sign(
 	if (isEmpty(secret)) {
 		return SealResult::failure(SealCode::InvalidArgument, "secret is required");
 	}
-	std::string payloadJson;
-	SealResult result = serializeDocument(payload, _impl->config.maxPayloadSize, payloadJson);
+
+	auto payloadJson = Strata::makeString(_impl->allocationPlacement());
+	SealResult result = serializeDocument(
+	    payload,
+	    _impl->config.maxPayloadSize,
+	    _impl->allocationPlacement(),
+	    payloadJson
+	);
 	if (!result) {
 		return result;
 	}
-	SealJob *job = new (std::nothrow) SealJob();
-	if (job == nullptr) {
+	SealJobPtr job = _impl->makeJob();
+	if (!job) {
 		return SealResult::failure(SealCode::AllocationFailed, "job allocation failed");
 	}
 	job->type = SealJobType::Sign;
@@ -1293,7 +1361,7 @@ SealResult Seal::sign(
 	job->secret = secret;
 	job->signOptions = options;
 	job->signCallback = std::move(callback);
-	return _impl->submitJob(job);
+	return _impl->submitJob(std::move(job));
 }
 
 SealResult Seal::verify(
@@ -1329,8 +1397,8 @@ SealResult Seal::verify(
 	if (std::strlen(token) > _impl->config.maxTokenSize) {
 		return SealResult::failure(SealCode::BufferTooSmall, "token exceeds configured size limit");
 	}
-	SealJob *job = new (std::nothrow) SealJob();
-	if (job == nullptr) {
+	SealJobPtr job = _impl->makeJob();
+	if (!job) {
 		return SealResult::failure(SealCode::AllocationFailed, "job allocation failed");
 	}
 	job->type = SealJobType::Verify;
@@ -1338,7 +1406,7 @@ SealResult Seal::verify(
 	job->secret = secret;
 	job->verifyOptions = options;
 	job->verifyCallback = std::move(callback);
-	return _impl->submitJob(job);
+	return _impl->submitJob(std::move(job));
 }
 
 SealResult Seal::decode(const char *token, SealDecodeCallback callback) {
@@ -1361,14 +1429,14 @@ SealResult Seal::decode(const char *token, SealDecodeCallback callback) {
 	if (std::strlen(token) > _impl->config.maxTokenSize) {
 		return SealResult::failure(SealCode::BufferTooSmall, "token exceeds configured size limit");
 	}
-	SealJob *job = new (std::nothrow) SealJob();
-	if (job == nullptr) {
+	SealJobPtr job = _impl->makeJob();
+	if (!job) {
 		return SealResult::failure(SealCode::AllocationFailed, "job allocation failed");
 	}
 	job->type = SealJobType::Decode;
 	job->token = token;
 	job->decodeCallback = std::move(callback);
-	return _impl->submitJob(job);
+	return _impl->submitJob(std::move(job));
 }
 
 const char *Seal::codeToString(SealCode code) const {
