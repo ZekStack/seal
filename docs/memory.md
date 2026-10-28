@@ -1,6 +1,6 @@
 # Memory
 
-Seal v0.2.0 routes Seal-owned allocations through Strata v0.1.2. The caller chooses placement through `SealConfig::memory`, while safety-critical FreeRTOS metadata remains internal.
+Seal v0.2.0 routes Seal-owned allocations through Strata v0.1.4. The caller chooses placement through `SealConfig::memory`, while safety-critical FreeRTOS metadata remains internal.
 
 ## Defaults
 
