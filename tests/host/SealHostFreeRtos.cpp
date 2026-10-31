@@ -398,6 +398,12 @@ TaskHandle_t xTaskCreateStaticPinnedToCore(
 	return xTaskCreateStatic(entry, name, stackDepth, arg, priority, stackStorage, controlBlock);
 }
 
+// Strata's ESP-IDF teardown checks core execution before releasing static
+// task memory. Our fake task termination is coordinated by its own lifecycle.
+TaskHandle_t xTaskGetCurrentTaskHandleForCore(BaseType_t) {
+	return nullptr;
+}
+
 TaskHandle_t xTaskGetCurrentTaskHandle() {
 	if (gCurrentTask != nullptr) {
 		return gCurrentTask;
@@ -427,10 +433,8 @@ void vTaskSuspend(TaskHandle_t task) {
 		gCurrentTask = nullptr;
 		pthread_exit(nullptr);
 	}
-	std::unique_lock<std::mutex> lock(gControlMutex);
-	gControlCv.wait(lock, [target] {
-		return target->deleteRequested.load();
-	});
+	// External suspension is immediate on the ESP-IDF port. Waiting for a
+	// delete request here deadlocks Strata 0.1.4's suspend-before-delete path.
 }
 
 void vTaskDelay(TickType_t ticks) {

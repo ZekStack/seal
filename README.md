@@ -1,5 +1,7 @@
 # Seal
 
+> Current version: **v0.3.0**. Strata is pinned to **v0.1.4**.
+
 Seal is a compact JWT/JWS signing, verification, and decode library for ESP32.
 
 Seal helps Arduino ESP32 projects create and validate HS256 JSON Web Tokens with caller-configurable size limits, Strata-backed memory placement, result-based errors, async APIs, and an internal crypto backend boundary.
@@ -19,7 +21,7 @@ Seal helps Arduino ESP32 projects create and validate HS256 JSON Web Tokens with
 
 ## Install
 
-Seal v0.2.0 requires Strata v0.1.2 and ArduinoJson 7.
+Seal v0.3.0 requires Strata v0.1.4 and ArduinoJson 7.
 
 ### PlatformIO
 
@@ -31,7 +33,7 @@ framework = arduino
 
 lib_deps =
   https://github.com/ZekStack/seal.git
-  https://github.com/ZekStack/strata.git#v0.1.2
+  https://github.com/ZekStack/strata.git#v0.1.4
   bblanchon/ArduinoJson@>=7.0.0
 ```
 
@@ -39,7 +41,7 @@ lib_deps =
 
 This library is not published to Arduino Library Manager yet.
 
-Install Seal, Strata v0.1.2, and ArduinoJson 7 into your Arduino libraries folder.
+Install Seal, Strata v0.1.4, and ArduinoJson 7 into your Arduino libraries folder.
 
 ```txt
 Arduino/libraries/Seal
@@ -169,9 +171,9 @@ For the full API, see [`docs/api.md`](docs/api.md).
 | Platform     | `espressif32`                   |
 | Language     | C++20                           |
 | Algorithms   | HS256                           |
-| Dependencies | ArduinoJson v7, Strata v0.1.2, mbedTLS |
+| Dependencies | ArduinoJson v7, Strata v0.1.4, mbedTLS |
 | Exceptions   | Not used by Seal production code |
-| Status       | Early-stage `0.2.0`             |
+| Status       | Early-stage `0.3.0` |
 
 ## jsonwebtoken Compatibility
 
